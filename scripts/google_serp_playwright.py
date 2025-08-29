@@ -1,14 +1,11 @@
-
 # -*- coding: utf-8 -*-
 """
-Тестовый Playwright-скрапер:
-- Имитирует Chromium (headless) в GitHub Actions.
-- Открывает Google, выполняет запрос, извлекает первые результаты.
-- Сохраняет JSON и скриншот в папку out/ (будет артефактом job).
-
-Примечания:
-- Это учебный пример. Для постоянной загрузки SERP используйте Google Custom Search JSON API.
-- В ЕС Google может показывать cookie/consent — пытаемся нажать "Accept".
+Robust Playwright Google SERP (for CI):
+- Chromium headless в GH Actions
+- Базовая версия выдачи (gbv=1)
+- Расширенная обработка consent/блокировок
+- Всегда сохраняем HTML/скриншот
+- При блокировке не падаем: result.json с blocked=true
 """
 
 import os
@@ -17,60 +14,63 @@ import asyncio
 import datetime
 import random
 from urllib.parse import quote_plus
+from playwright.async_api import async_playwright
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
-
-# ===== Настройки =====
+# ===== Параметры =====
 QUERY = os.environ.get("QUERY") or "site:example.com"
-GOOGLE_SEARCH_URL = "https://www.google.com/search?q={query}&hl=en&gl=us&pws=0&num=10"
+
+# gbv=1 — упрощённая HTML-версия выдачи; hl/gl можно менять
+GOOGLE_SEARCH_URL = (
+    "https://www.google.com/search?q={query}&hl=en&gl=us&pws=0&num=10&gbv=1"
+)
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/123.0.0.0 Safari/537.36"
 )
-
 ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 LOCALE = "en-US"
-TIMEZONE_ID = "Europe/Athens"  # не критично; просто пример
+TIMEZONE_ID = "Europe/Athens"
 VIEWPORT = {"width": 1280, "height": 800}
-NAV_TIMEOUT_MS = 30000  # 30s
 
+NAV_TIMEOUT_MS = 45000
 MIN_PAUSE = 0.3
 MAX_PAUSE = 0.7
 
+OUT_DIR = "out"
 
 def utcnow_iso():
     return datetime.datetime.utcnow().isoformat() + "Z"
 
-
 async def maybe_accept_consent(page) -> bool:
     """
-    Пытаемся нажать кнопку согласия, если всплыла (EU consent).
-    Возвращает True, если кликнули что-то похожее на "Accept".
+    Пытаемся нажать кнопки согласия cookie/consent (разные варианты).
+    Возвращает True, если что-то нажали.
     """
-    candidates = [
-        'button#L2AGLb',  # частый id у Google
+    selectors = [
+        'button#L2AGLb',
         'button:has-text("I agree")',
         'button:has-text("Accept all")',
         'button:has-text("Accept")',
         'button[aria-label="Accept all"]',
         'form[action*="consent"] button[type="submit"]',
+        'div[role="dialog"] button:has-text("Accept")',
         'button:has-text("Принять")',
         'button:has-text("Согласен")',
     ]
-    # Сначала пробуем в основном фрейме
-    for sel in candidates:
+    # основной фрейм
+    for sel in selectors:
         try:
             await page.locator(sel).first.click(timeout=1200)
             await page.wait_for_timeout(400)
             return True
         except Exception:
             pass
-    # Затем пробуем во фреймах (если политика в iframe)
+    # во фреймах
     try:
         for frame in page.frames:
-            for sel in candidates:
+            for sel in selectors:
                 try:
                     await frame.locator(sel).first.click(timeout=800)
                     await page.wait_for_timeout(400)
@@ -81,15 +81,92 @@ async def maybe_accept_consent(page) -> bool:
         pass
     return False
 
+async def detect_google_block(page) -> str:
+    """
+    Возвращает строку-причину блокировки либо ''.
+    Ищем характерные признаки "sorry/unusual traffic".
+    """
+    try:
+        url = page.url or ""
+        if "/sorry/" in url:
+            return "Google 'Sorry' page (rate-limited/captcha)."
+
+        body_text = ""
+        try:
+            body_text = await page.inner_text("body", timeout=2000)
+        except Exception:
+            pass
+        low = (body_text or "").lower()
+
+        markers = [
+            "unusual traffic from your computer network",
+            "to continue, please type the characters",
+            "automated queries",
+            "detected unusual traffic",
+        ]
+        for m in markers:
+            if m in low:
+                return "Unusual traffic / captcha detected."
+    except Exception:
+        pass
+    return ""
+
+async def extract_results(page):
+    """
+    Возвращает список результатов [{title, url}], стараясь покрыть базовую/обычную верстку.
+    """
+    # ждём любой из контейнеров выдачи
+    containers = ["div#search", "div#main", "div#rso"]
+    found = None
+    for sel in containers:
+        try:
+            await page.wait_for_selector(sel, timeout=10000)
+            found = sel
+            break
+        except Exception:
+            pass
+
+    if not found:
+        return [], None
+
+    # парсим — сперва h3 внутри ссылок
+    results = await page.evaluate("""
+    () => {
+      function abs(u){ try { return new URL(u, location.href).href } catch(e){ return u || '' } }
+      const items = [];
+      document.querySelectorAll('a h3').forEach(h3 => {
+        const a = h3.closest('a');
+        if (a && a.href) {
+          const title = (h3.textContent || '').trim();
+          if (title) items.push({ title, url: abs(a.href) });
+        }
+      });
+      // Fallback для базовой версии/иной разметки
+      if (items.length < 5) {
+        document.querySelectorAll('div#search a[href*="/url?"]').forEach(a => {
+          const title = (a.textContent || '').trim();
+          if (title) items.push({ title, url: abs(a.href) });
+        });
+      }
+      // dedup + top10
+      const seen = new Set();
+      const out = [];
+      for (const it of items) {
+        if (it.url && !seen.has(it.url)) {
+          seen.add(it.url);
+          out.push(it);
+        }
+      }
+      return out.slice(0, 10);
+    }
+    """)
+
+    return results, found
 
 async def run():
-    os.makedirs("out", exist_ok=True)
-
+    os.makedirs(OUT_DIR, exist_ok=True)
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox"]
-        )
+        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
         context = await browser.new_context(
             user_agent=USER_AGENT,
             locale=LOCALE,
@@ -99,59 +176,51 @@ async def run():
         )
         page = await context.new_page()
 
-        # Переходим сразу на выдачу с параметрами
         url = GOOGLE_SEARCH_URL.format(query=quote_plus(QUERY))
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-        except PWTimeout:
-            # иногда редиректит на согласие — подождём и снова попробуем
-            pass
-
-        # Если всплыло согласие — нажмём
-        try:
-            await maybe_accept_consent(page)
-        except Exception:
-            pass
-
-        # Дождёмся блока результатов
-        await page.wait_for_selector("div#search", timeout=20000)
+        await page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+        await maybe_accept_consent(page)
         await page.wait_for_timeout(int(1000 * random.uniform(MIN_PAUSE, MAX_PAUSE)))
 
-        # Собираем топовые результаты (заголовок + ссылка)
-        # Берём h3 внутри ссылок в основном блоке результатов
-        results = await page.evaluate("""
-        () => {
-          const out = [];
-          document.querySelectorAll('div#search a h3').forEach(h3 => {
-            const a = h3.closest('a');
-            if (a && a.href) {
-              const title = (h3.textContent || '').trim();
-              if (title) out.push({ title, url: a.href });
-            }
-          });
-          return out.slice(0, 10);
-        }
-        """)
-
-        # Скриншот «как видим выдачу»
+        # сохраняем HTML/скриншот как можно раньше для диагностики
         safe_query = QUERY.replace(" ", "_").replace("/", "_")
-        screenshot_path = f"out/google_{safe_query}.png"
-        await page.screenshot(path=screenshot_path, full_page=True)
+        screenshot_path = f"{OUT_DIR}/google_{safe_query}.png"
+        html_path = f"{OUT_DIR}/google_{safe_query}.html"
+
+        # Пробуем понять, не блок ли
+        block_reason = await detect_google_block(page)
+
+        # Пытаемся извлечь результаты
+        results, container = await extract_results(page)
+
+        # Сохраняем скрин/HTML в любом раскладе
+        try:
+            await page.screenshot(path=screenshot_path, full_page=True)
+        except Exception:
+            pass
+        try:
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(await page.content())
+        except Exception:
+            pass
 
         data = {
             "scraped_at_utc": utcnow_iso(),
             "query": QUERY,
+            "page_url": page.url,
+            "container": container,
+            "blocked": bool(block_reason) or (not results and not container),
+            "block_reason": block_reason,
             "count": len(results),
-            "results": results
+            "results": results,
         }
-        with open("out/result.json", "w", encoding="utf-8") as f:
+        with open(f"{OUT_DIR}/result.json", "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
         await context.close()
         await browser.close()
 
-    print("Saved → out/result.json and screenshot")
-
+    # Не бросаем исключение — job должен завершаться успехом.
+    print("Saved → out/result.json (+ html/png).")
 
 if __name__ == "__main__":
     asyncio.run(run())
