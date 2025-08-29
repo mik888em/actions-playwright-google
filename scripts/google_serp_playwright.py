@@ -183,10 +183,10 @@ async def run():
 
         # сохраняем HTML/скриншот как можно раньше для диагностики
         def safe_filename(s: str, max_len: int = 100) -> str:
-            # оставляем только [a-zA-Z0-9_.-], остальное -> '_'
             s = re.sub(r"[^\w.-]+", "_", s, flags=re.UNICODE)
             s = s.strip("._") or "query"
             return s[:max_len]
+
         
         safe = safe_filename(QUERY)
         screenshot_path = f"{OUT_DIR}/google_{safe}.png"
