@@ -7,7 +7,7 @@ Robust Playwright Google SERP (for CI):
 - Всегда сохраняем HTML/скриншот
 - При блокировке не падаем: result.json с blocked=true
 """
-
+import re
 import os
 import json
 import asyncio
@@ -41,7 +41,7 @@ MAX_PAUSE = 0.7
 OUT_DIR = "out"
 
 def utcnow_iso():
-    return datetime.datetime.utcnow().isoformat() + "Z"
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 async def maybe_accept_consent(page) -> bool:
     """
@@ -182,9 +182,15 @@ async def run():
         await page.wait_for_timeout(int(1000 * random.uniform(MIN_PAUSE, MAX_PAUSE)))
 
         # сохраняем HTML/скриншот как можно раньше для диагностики
-        safe_query = QUERY.replace(" ", "_").replace("/", "_")
-        screenshot_path = f"{OUT_DIR}/google_{safe_query}.png"
-        html_path = f"{OUT_DIR}/google_{safe_query}.html"
+        def safe_filename(s: str, max_len: int = 100) -> str:
+            # оставляем только [a-zA-Z0-9_.-], остальное -> '_'
+            s = re.sub(r"[^\w.-]+", "_", s, flags=re.UNICODE)
+            s = s.strip("._") or "query"
+            return s[:max_len]
+        
+        safe = safe_filename(QUERY)
+        screenshot_path = f"{OUT_DIR}/google_{safe}.png"
+        html_path = f"{OUT_DIR}/google_{safe}.html"
 
         # Пробуем понять, не блок ли
         block_reason = await detect_google_block(page)
