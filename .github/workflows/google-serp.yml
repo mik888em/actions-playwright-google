@@ -31,7 +31,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-playwright.txt
           python -m playwright install --with-deps chromium
-
+          
+      - name: Show repo tree (debug)
+        run: |
+          pwd
+          ls -la
+          find . -maxdepth 3 -type f | sort
+          
       - name: Run scraper
         env:
           QUERY: ${{ github.event.inputs.query }}
