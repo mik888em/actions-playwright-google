@@ -1,7 +1,6 @@
 name: Playwright Google SERP
 
 on:
-  # ручной запуск из вкладки Actions
   workflow_dispatch:
     inputs:
       query:
@@ -9,17 +8,17 @@ on:
         required: false
         default: 'site:example.com'
 
-  # пример расписания (ОТКЛЮЧЕНО, чтобы не жечь минуты)
-  # schedule:
-  #   - cron: "17 */12 * * *"   # раз в 12 часов, 17-я минута (UTC)
-
 jobs:
   serp:
-    runs-on: ubuntu-latest         # Linux → множитель минут ×1
-    timeout-minutes: 10            # защита от зависаний
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
-      - name: Checkout
+      - name: Checkout (force main)
         uses: actions/checkout@v4
+        with:
+          ref: main           # <-- гарантируем, что берётся ветка main
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -31,18 +30,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-playwright.txt
           python -m playwright install --with-deps chromium
-          
+
       - name: Show repo tree (debug)
         run: |
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
           pwd
           ls -la
-          find . -maxdepth 3 -type f | sort
-          
+          echo "----- find (maxdepth 3) -----"
+          find . -maxdepth 3 -type f -print | sort
+          echo "----- check file exists -----"
+          test -f ./scripts/google_serp_playwright.py && echo "OK: file exists" || (echo "ERROR: file missing" && exit 1)
+
       - name: Run scraper
         env:
           QUERY: ${{ github.event.inputs.query }}
         run: |
-          python scripts/google_serp_playwright.py
+          python ./scripts/google_serp_playwright.py
 
       - name: Upload artifacts (JSON + screenshot)
         uses: actions/upload-artifact@v4
