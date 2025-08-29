@@ -36,7 +36,7 @@ jobs:
         env:
           QUERY: ${{ github.event.inputs.query }}
         run: |
-          python scripts/google_serp_playwright.py
+          python .github/workflows/scripts/google_serp_playwright.py
 
       - name: Upload artifacts (JSON + screenshot)
         uses: actions/upload-artifact@v4
