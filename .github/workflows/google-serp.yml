@@ -3,10 +3,18 @@ name: Playwright Google SERP
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: 'Режим: google или demo'
+        required: true
+        default: 'demo'
       query:
-        description: 'Запрос для поиска в Google'
+        description: 'Запрос для Google (используется при mode=google)'
         required: false
         default: 'site:example.com'
+      url:
+        description: 'URL для демо-скрапинга (используется при mode=demo)'
+        required: false
+        default: 'https://httpbin.org/html'
 
 jobs:
   serp:
@@ -17,7 +25,7 @@ jobs:
       - name: Checkout (force main)
         uses: actions/checkout@v4
         with:
-          ref: main           # <-- гарантируем, что берётся ветка main
+          ref: main
           fetch-depth: 1
 
       - name: Set up Python
@@ -38,18 +46,26 @@ jobs:
           ls -la
           echo "----- find (maxdepth 3) -----"
           find . -maxdepth 3 -type f -print | sort
-          echo "----- check file exists -----"
-          test -f ./scripts/google_serp_playwright.py && echo "OK: file exists" || (echo "ERROR: file missing" && exit 1)
+          echo "----- check files exist -----"
+          test -f ./scripts/google_serp_playwright.py && echo "OK: google_serp_playwright.py"
+          test -f ./scripts/demo_playwright.py && echo "OK: demo_playwright.py" || echo "demo_playwright.py (опционально, для mode=demo)"
 
       - name: Run scraper
         env:
           QUERY: ${{ github.event.inputs.query }}
+          MODE:  ${{ github.event.inputs.mode }}
+          URL:   ${{ github.event.inputs.url }}
         run: |
-          python ./scripts/google_serp_playwright.py
+          set -e
+          echo "MODE=$MODE"
+          if [ "$MODE" = "demo" ]; then
+            python ./scripts/demo_playwright.py
+          else
+            python ./scripts/google_serp_playwright.py
+          fi
 
       - name: Upload artifacts (JSON + screenshot)
         uses: actions/upload-artifact@v4
         with:
           name: google-serp-output
           path: out/
-
