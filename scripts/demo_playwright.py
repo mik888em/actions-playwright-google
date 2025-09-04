@@ -1,7 +1,14 @@
 # -*- coding: utf-8 -*-
-import os, re, json, datetime, asyncio
+"""
+CryptoPanic demo with Playwright:
+- waits 5s after load, tries to accept cookies
+- infinite-scroll until >=300 items AND at least R steps (R in [30..40])
+- handles "Loading..." and "Load more" at the bottom (with reload fallback)
+- extracts structured news items and saves into out/demo.json (+ html/png)
+"""
+import os, re, json, datetime, asyncio, random, time
 from urllib.parse import urlparse
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 OUT_DIR = "out"
 URL = os.environ.get("URL") or "https://cryptopanic.com"
@@ -16,19 +23,28 @@ LOCALE = "en-US"
 TIMEZONE_ID = "Europe/Athens"
 VIEWPORT = {"width": 1280, "height": 800}
 
-# Тайминги / селекторы
-EXTRA_WAIT_MS = 5000            # ждём после загрузки страницы
-NEWS_WAIT_TIMEOUT = 20000       # ждём появления первой новости
-NEWS_ITEM_SELECTOR = ".news-row.news-row-link, .news-cell.nc-date"
+# --- timing / selectors
+EXTRA_WAIT_MS = 5000           # wait after first load
+NEWS_WAIT_TIMEOUT = 20000      # wait for first news row
+SCROLL_PAUSE_MS = 350          # pause between scrolls
+SCROLL_MAX_STEPS = 900         # hard safety limit per attempt
+STALL_LIMIT = 15               # how many "no progress" iterations we tolerate
+
+SCROLL_TARGET_MIN = 300        # want at least this many news
+RAND_SCROLLS_MIN = 30          # lower bound of random minimal scroll steps
+RAND_SCROLLS_MAX = 40          # upper bound
+
+NEWS_ITEM_SELECTOR = "div.news-row.news-row-link"
 CONTAINER_CANDIDATES = [
-    "div.news-container.ps",        # основной контейнер с perfect-scrollbar
+    "div.news-container.ps",   # perfect-scrollbar container (most likely)
     "div.news-container",
     "div[class*='news-container']",
 ]
-SCROLL_TARGET_MIN = 300          # хотим минимум столько карточек
-SCROLL_PAUSE_MS = 400            # пауза между скроллами
-SCROLL_MAX_STEPS = 600           # предохранитель
-STALL_LIMIT = 12                 # сколько "пустых" итераций терпим
+
+# bottom controls
+LOAD_MORE_ROOT = "div.news-load-more"
+LOAD_MORE_BTN = f"{LOAD_MORE_ROOT} button:has-text('Load more')"
+LOADING_SPAN = f"{LOAD_MORE_ROOT} span:has-text('Loading...')"
 
 def utcnow_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -39,7 +55,7 @@ def safe_filename(s: str, max_len: int = 80) -> str:
 
 async def maybe_accept_cookies(page) -> bool:
     """
-    Пытаемся убрать куки-баннер CryptoPanic: <a class="btn btn-outline-primary">Accept</a>.
+    Tries to dismiss cookie banner on CryptoPanic.
     """
     selectors = [
         'a.btn.btn-outline-primary:has-text("Accept")',
@@ -60,7 +76,7 @@ async def maybe_accept_cookies(page) -> bool:
 
 async def pick_scroll_container(page):
     """
-    Возвращает локатор скролл-контейнера, если найден, иначе None.
+    Returns (selector, locator) for the scrollable container, or (None, None).
     """
     for sel in CONTAINER_CANDIDATES:
         loc = page.locator(sel).first
@@ -71,41 +87,135 @@ async def pick_scroll_container(page):
             pass
     return None, None
 
-async def scroll_until_count(page, item_selector, min_count, container_loc=None):
+async def wait_loading_spinner_disappear(page) -> bool:
     """
-    Скроллит страницу/контейнер вниз, пока не наберём min_count элементов
-    или не упрёмся в лимиты.
+    If 'Loading...' visible at the bottom, wait up to 10s until it goes away.
+    Returns True if it's gone, False if timed out.
+    """
+    root = page.locator(LOADING_SPAN)
+    try:
+        if await root.count() == 0:
+            return True
+        await root.wait_for(state="hidden", timeout=10_000)
+        return True
+    except PWTimeout:
+        return False
+    except Exception:
+        # if the locator misbehaved, don't block the flow
+        return True
+
+async def click_load_more_until_done(page) -> bool:
+    """
+    If 'Load more' button is present, click it every ~5s up to 15s total.
+    Returns True if button is gone (success), False if stuck (should reload).
+    """
+    started = time.monotonic()
+    while True:
+        btn = page.locator(LOAD_MORE_BTN)
+        try:
+            visible = await btn.is_visible()
+        except Exception:
+            visible = False
+
+        if not visible:
+            return True
+
+        try:
+            await btn.click(timeout=1500)
+        except Exception:
+            pass
+
+        await page.wait_for_timeout(5000)
+        # re-check
+        try:
+            if not await page.locator(LOAD_MORE_BTN).is_visible():
+                return True
+        except Exception:
+            return True
+
+        if time.monotonic() - started > 15:
+            return False
+
+async def scroll_once(page, container_loc):
+    """
+    Scrolls to bottom either inside the container or the whole page.
+    """
+    try:
+        if container_loc:
+            await container_loc.evaluate(
+                "el => { el.scrollTop = el.scrollHeight; }"
+            )
+        else:
+            await page.evaluate(
+                "window.scrollTo(0, document.scrollingElement ? document.scrollingElement.scrollHeight : document.body.scrollHeight)"
+            )
+    except Exception:
+        # fallback via mouse wheel
+        try:
+            await page.mouse.wheel(0, 2000)
+        except Exception:
+            pass
+
+async def ensure_progress_or_reload(page) -> bool:
+    """
+    Handles 'Loading...' and 'Load more' at the bottom.
+    Returns True if OK to continue; False if we should reload the page.
+    """
+    # Loading...
+    ok = await wait_loading_spinner_disappear(page)
+    if not ok:
+        return False
+
+    # Load more
+    ok = await click_load_more_until_done(page)
+    if not ok:
+        return False
+
+    return True
+
+async def scroll_until_goals(page, item_selector, min_items, min_steps, container_loc):
+    """
+    Scrolls until both goals are satisfied:
+      - have at least `min_items` items AND
+      - performed at least `min_steps` scroll steps.
+    Stops earlier on STALL_LIMIT/SCROLL_MAX_STEPS or reload requirement.
+
+    Returns dict with stats and whether reload is required.
     """
     steps = 0
     stalled = 0
-    last_count = await page.locator(item_selector).count()
+    try:
+        last_count = await page.locator(item_selector).count()
+    except Exception:
+        last_count = 0
 
     while steps < SCROLL_MAX_STEPS:
-        if last_count >= min_count:
+        # goals check first (we may already have enough)
+        if last_count >= min_items and steps >= min_steps:
             break
 
-        # Скролл
-        try:
-            if container_loc:
-                await container_loc.evaluate(
-                    "el => el.scrollTo({ top: el.scrollHeight, behavior: 'instant' })"
-                )
-            else:
-                await page.evaluate(
-                    "window.scrollTo(0, document.scrollingElement ? document.scrollingElement.scrollHeight : document.body.scrollHeight)"
-                )
-        except Exception:
-            # Фолбэк мышиным колесом
-            try:
-                await page.mouse.wheel(0, 1800)
-            except Exception:
-                pass
-
+        # do one scroll
+        await scroll_once(page, container_loc)
         await page.wait_for_timeout(SCROLL_PAUSE_MS)
         steps += 1
 
-        # Проверяем прогресс
-        curr = await page.locator(item_selector).count()
+        # check bottom controls
+        ok = await ensure_progress_or_reload(page)
+        if not ok:
+            return {
+                "final_count": last_count,
+                "steps": steps,
+                "stalled_iterations": stalled,
+                "reached_goal": False,
+                "reload_required": True,
+            }
+
+        # progress check
+        try:
+            curr = await page.locator(item_selector).count()
+        except Exception:
+            curr = last_count
+
         if curr <= last_count:
             stalled += 1
         else:
@@ -119,8 +229,39 @@ async def scroll_until_count(page, item_selector, min_count, container_loc=None)
         "final_count": last_count,
         "steps": steps,
         "stalled_iterations": stalled,
-        "reached_goal": last_count >= min_count,
+        "reached_goal": (last_count >= min_items and steps >= min_steps),
+        "reload_required": False,
     }
+
+EXTRACT_JS = """
+() => {
+  function abs(u){ try { return new URL(u, location.origin).href } catch(e){ return u || '' } }
+  const out = [];
+  const rows = document.querySelectorAll("div.news-row.news-row-link");
+  rows.forEach(row => {
+    const aTitle = row.querySelector("a.news-cell.nc-title");
+    const aDate  = row.querySelector("a.news-cell.nc-date");
+    const href   = (aTitle?.getAttribute("href") || aDate?.getAttribute("href") || "").trim();
+    const timeEl = row.querySelector("a.news-cell.nc-date time");
+    const time_iso = (timeEl?.getAttribute("datetime") || "").trim();
+    const time_rel = (timeEl?.textContent || "").trim();
+    // первый span в .title-text — это заголовок
+    const title = (row.querySelector(".nc-title .title-text span")?.textContent || "").trim();
+    const source = (row.querySelector(".si-source-domain")?.textContent || "").trim();
+    if (href) {
+      out.push({
+        url_rel: href,
+        url_abs: abs(href),
+        time_iso,
+        time_rel,
+        title,
+        source
+      });
+    }
+  });
+  return out;
+}
+"""
 
 async def run():
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -135,31 +276,51 @@ async def run():
         )
         page = await context.new_page()
 
-        # Загружаем страницу
-        await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
-
-        accepted = await maybe_accept_cookies(page)
-        await page.wait_for_timeout(EXTRA_WAIT_MS)
-
-        # Ждём, чтобы появилась хоть одна новость
-        news_ready = False
-        try:
-            await page.wait_for_selector(NEWS_ITEM_SELECTOR, timeout=NEWS_WAIT_TIMEOUT)
-            news_ready = True
-        except Exception:
-            news_ready = False  # всё равно продолжим
-
-        # Ищем скролл-контейнер
-        container_sel, container_loc = await pick_scroll_container(page)
-
-        # Скроллим до 300 элементов (если новости появились)
+        attempts = 0
+        max_attempts = 3
         scroll_stats = None
-        if news_ready:
-            scroll_stats = await scroll_until_count(
-                page, NEWS_ITEM_SELECTOR, SCROLL_TARGET_MIN, container_loc
-            )
+        container_sel = None
+        min_scrolls_required = random.randint(RAND_SCROLLS_MIN, RAND_SCROLLS_MAX)
+        accepted = False
+        news_ready = False
 
-        # Сохраняем HTML/скрин
+        while attempts < max_attempts:
+            attempts += 1
+
+            # load page
+            await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
+            # cookies + initial wait
+            accepted = await maybe_accept_cookies(page) or accepted
+            await page.wait_for_timeout(EXTRA_WAIT_MS)
+
+            # wait for at least one news row
+            try:
+                await page.wait_for_selector(NEWS_ITEM_SELECTOR, timeout=NEWS_WAIT_TIMEOUT)
+                news_ready = True
+            except Exception:
+                news_ready = False
+
+            # pick container and scroll
+            container_sel, container_loc = await pick_scroll_container(page)
+
+            if news_ready:
+                scroll_stats = await scroll_until_goals(
+                    page,
+                    NEWS_ITEM_SELECTOR,
+                    SCROLL_TARGET_MIN,
+                    min_scrolls_required,
+                    container_loc,
+                )
+                if scroll_stats.get("reload_required"):
+                    # reload and try again from scratch
+                    continue
+                else:
+                    break
+            else:
+                # nothing rendered? reload
+                continue
+
+        # save HTML/screenshot for diagnostics
         host = urlparse(URL).netloc or "demo"
         stem = safe_filename(host)
         html_path = f"{OUT_DIR}/demo_{stem}.html"
@@ -175,15 +336,23 @@ async def run():
         except Exception:
             pass
 
-        # Итоговый JSON
+        # parse items from DOM
+        items = []
+        try:
+            items = await page.evaluate(EXTRACT_JS)
+        except Exception:
+            items = []
+
         result = {
             "scraped_at_utc": utcnow_iso(),
             "url": URL,
+            "attempts": attempts,
             "accepted_cookies": accepted,
             "news_ready": news_ready,
-            "wait_ms": EXTRA_WAIT_MS,
-            "container_selector": container_sel,
+            "min_scrolls_required": min_scrolls_required,
             "scroll": scroll_stats,
+            "found": len(items),
+            "items": items,               # список словарей с полезными полями
             "html_file": html_path,
             "screenshot_file": png_path,
         }
