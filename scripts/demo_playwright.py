@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-CryptoPanic demo with Playwright:
-- waits 5s after load, tries to accept cookies
-- infinite-scroll until >=300 items AND at least R steps (R in [30..40])
-- handles "Loading..." and "Load more" at the bottom (with reload fallback)
-- extracts structured news items and saves into out/demo.json (+ html/png)
+CryptoPanic demo with Playwright + enrich:
+- JS-экстрактор нормализует время в UTC 'YYYY-MM-DDTHH:MM:SSZ'
+- извлекается id_news
+- concurrent GET к https://cryptopanic.com/news/click/{id}/ -> original_url
+- фильтр по source/original_url на binance.com/x.com/youtube.com
+- coins + votes (как в примере из JS)
+- удаление дублей по id_news
 """
-import os, re, json, datetime, asyncio, random, time
+import os, re, json, datetime, asyncio, random, time, email.utils
 from urllib.parse import urlparse
+import requests
+
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 OUT_DIR = "out"
@@ -46,6 +50,9 @@ LOAD_MORE_ROOT = "div.news-load-more"
 LOAD_MORE_BTN = f"{LOAD_MORE_ROOT} button:has-text('Load more')"
 LOADING_SPAN = f"{LOAD_MORE_ROOT} span:has-text('Loading...')"
 
+BANNED_SUBSTRINGS = ("binance.com", "x.com", "youtube.com")
+
+# ---------------- utils ----------------
 def utcnow_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
@@ -53,10 +60,30 @@ def safe_filename(s: str, max_len: int = 80) -> str:
     s = re.sub(r"[^\w.-]+", "_", s, flags=re.UNICODE).strip("._") or "file"
     return s[:max_len]
 
+def normalize_time_iso_py(s: str) -> str:
+    """
+    Страховка: привести строку даты к 'YYYY-MM-DDTHH:MM:SSZ' (UTC).
+    Если не удается — вернуть исходник.
+    """
+    if not s:
+        return s
+    try:
+        # стандартный ISO 8601 либо с Z, либо с оффсетом
+        if s.endswith("Z"):
+            dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        else:
+            dt = datetime.datetime.fromisoformat(s)
+        return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        try:
+            # попытка распарсить странные строки вида 'Thu Sep 04 2025 ...'
+            dt = email.utils.parsedate_to_datetime(s)
+            return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            return s
+
+# ---------------- page helpers ----------------
 async def maybe_accept_cookies(page) -> bool:
-    """
-    Tries to dismiss cookie banner on CryptoPanic.
-    """
     selectors = [
         'a.btn.btn-outline-primary:has-text("Accept")',
         'a:has-text("Accept")',
@@ -75,9 +102,6 @@ async def maybe_accept_cookies(page) -> bool:
     return False
 
 async def pick_scroll_container(page):
-    """
-    Returns (selector, locator) for the scrollable container, or (None, None).
-    """
     for sel in CONTAINER_CANDIDATES:
         loc = page.locator(sel).first
         try:
@@ -88,10 +112,6 @@ async def pick_scroll_container(page):
     return None, None
 
 async def wait_loading_spinner_disappear(page) -> bool:
-    """
-    If 'Loading...' visible at the bottom, wait up to 10s until it goes away.
-    Returns True if it's gone, False if timed out.
-    """
     root = page.locator(LOADING_SPAN)
     try:
         if await root.count() == 0:
@@ -101,14 +121,9 @@ async def wait_loading_spinner_disappear(page) -> bool:
     except PWTimeout:
         return False
     except Exception:
-        # if the locator misbehaved, don't block the flow
         return True
 
 async def click_load_more_until_done(page) -> bool:
-    """
-    If 'Load more' button is present, click it every ~5s up to 15s total.
-    Returns True if button is gone (success), False if stuck (should reload).
-    """
     started = time.monotonic()
     while True:
         btn = page.locator(LOAD_MORE_BTN)
@@ -126,7 +141,6 @@ async def click_load_more_until_done(page) -> bool:
             pass
 
         await page.wait_for_timeout(5000)
-        # re-check
         try:
             if not await page.locator(LOAD_MORE_BTN).is_visible():
                 return True
@@ -137,36 +151,24 @@ async def click_load_more_until_done(page) -> bool:
             return False
 
 async def scroll_once(page, container_loc):
-    """
-    Scrolls to bottom either inside the container or the whole page.
-    """
     try:
         if container_loc:
-            await container_loc.evaluate(
-                "el => { el.scrollTop = el.scrollHeight; }"
-            )
+            await container_loc.evaluate("el => { el.scrollTop = el.scrollHeight; }")
         else:
             await page.evaluate(
                 "window.scrollTo(0, document.scrollingElement ? document.scrollingElement.scrollHeight : document.body.scrollHeight)"
             )
     except Exception:
-        # fallback via mouse wheel
         try:
             await page.mouse.wheel(0, 2000)
         except Exception:
             pass
 
 async def ensure_progress_or_reload(page) -> bool:
-    """
-    Handles 'Loading...' and 'Load more' at the bottom.
-    Returns True if OK to continue; False if we should reload the page.
-    """
-    # Loading...
     ok = await wait_loading_spinner_disappear(page)
     if not ok:
         return False
 
-    # Load more
     ok = await click_load_more_until_done(page)
     if not ok:
         return False
@@ -174,14 +176,6 @@ async def ensure_progress_or_reload(page) -> bool:
     return True
 
 async def scroll_until_goals(page, item_selector, min_items, min_steps, container_loc):
-    """
-    Scrolls until both goals are satisfied:
-      - have at least `min_items` items AND
-      - performed at least `min_steps` scroll steps.
-    Stops earlier on STALL_LIMIT/SCROLL_MAX_STEPS or reload requirement.
-
-    Returns dict with stats and whether reload is required.
-    """
     steps = 0
     stalled = 0
     try:
@@ -190,16 +184,13 @@ async def scroll_until_goals(page, item_selector, min_items, min_steps, containe
         last_count = 0
 
     while steps < SCROLL_MAX_STEPS:
-        # goals check first (we may already have enough)
         if last_count >= min_items and steps >= min_steps:
             break
 
-        # do one scroll
         await scroll_once(page, container_loc)
         await page.wait_for_timeout(SCROLL_PAUSE_MS)
         steps += 1
 
-        # check bottom controls
         ok = await ensure_progress_or_reload(page)
         if not ok:
             return {
@@ -210,7 +201,6 @@ async def scroll_until_goals(page, item_selector, min_items, min_steps, containe
                 "reload_required": True,
             }
 
-        # progress check
         try:
             curr = await page.locator(item_selector).count()
         except Exception:
@@ -233,9 +223,57 @@ async def scroll_until_goals(page, item_selector, min_items, min_steps, containe
         "reload_required": False,
     }
 
-EXTRACT_JS = """
+# ----------- JS extractor (расширенный) -----------
+EXTRACT_JS = r"""
 () => {
   function abs(u){ try { return new URL(u, location.origin).href } catch(e){ return u || '' } }
+  function isoUTCFromAttr(el){
+    try{
+      if(!el) return "";
+      const raw = el.getAttribute("datetime") || "";
+      if(!raw) return "";
+      const d = new Date(raw);
+      if (isNaN(d)) return "";
+      // toISOString уже в UTC; уберем миллисекунды для строгого формата
+      return d.toISOString().replace(/\.\d{3}Z$/, "Z");
+    } catch(e){ return "" }
+  }
+  function extractCoins(row){
+    const zone = row.querySelector(".news-cell.nc-currency");
+    if(!zone) return "---";
+    const coins = [];
+    zone.querySelectorAll("a[href]").forEach(a=>{
+      const h = a.getAttribute("href") || "";
+      const m = h.match(/\/news\/([^\/]+)\//i);
+      if(m){
+        let tick = (a.textContent || "").trim();
+        if(tick && tick[0] !== "$") tick = "$" + tick + " ";
+        coins.push({ coin: m[1], tick });
+      }
+    });
+    return coins.length ? coins : "---";
+  }
+  function extractVotes(row){
+    const votes = {comments:0, likes:0, dislikes:0, lol:0, save:0, important:0, negative:0, neutral:0};
+    row.querySelectorAll("[title]").forEach(el=>{
+      const t = (el.getAttribute("title") || "").toLowerCase();
+      const m = t.match(/(\d+)\s+(comments?|like|dislike|lol|save|important|negative|neutral)\s+votes?/i);
+      if(m){
+        const n = parseInt(m[1],10);
+        const key = m[2];
+        if(/comment/.test(key)) votes.comments = n;
+        else if(key==="like") votes.likes = n;
+        else if(key==="dislike") votes.dislikes = n;
+        else if(key==="lol") votes.lol = n;
+        else if(key==="save") votes.save = n;
+        else if(key==="important") votes.important = n;
+        else if(key==="negative") votes.negative = n;
+        else if(key==="neutral") votes.neutral = n;
+      }
+    });
+    return votes;
+  }
+
   const out = [];
   const rows = document.querySelectorAll("div.news-row.news-row-link");
   rows.forEach(row => {
@@ -243,25 +281,87 @@ EXTRACT_JS = """
     const aDate  = row.querySelector("a.news-cell.nc-date");
     const href   = (aTitle?.getAttribute("href") || aDate?.getAttribute("href") || "").trim();
     const timeEl = row.querySelector("a.news-cell.nc-date time");
-    const time_iso = (timeEl?.getAttribute("datetime") || "").trim();
+    const time_iso_utc = isoUTCFromAttr(timeEl);
     const time_rel = (timeEl?.textContent || "").trim();
-    // первый span в .title-text — это заголовок
     const title = (row.querySelector(".nc-title .title-text span")?.textContent || "").trim();
     const source = (row.querySelector(".si-source-domain")?.textContent || "").trim();
+    const idm = href.match(/\/news\/(\d+)/);
+    const id_news = idm ? idm[1] : "";
+
     if (href) {
       out.push({
         url_rel: href,
         url_abs: abs(href),
-        time_iso,
+        time_iso: time_iso_utc,
         time_rel,
         title,
-        source
+        source,
+        id_news,
+        coins: extractCoins(row),
+        votes: extractVotes(row)
       });
     }
   });
   return out;
 }
 """
+
+# ----------- click resolver (конкурентно с ограничением) -----------
+def _resolve_click_sync(id_news: str) -> str:
+    """
+    Синхронный резолвер оригинальной ссылки.
+    Возвращает финальный URL (200), либо 'HTTP_XXX:...'/ 'ERROR:...'
+    """
+    try:
+        url = f"https://cryptopanic.com/news/click/{id_news}/"  # важно: со слешем
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept-Language": ACCEPT_LANGUAGE,
+            "Referer": "https://cryptopanic.com/",
+        }
+        r = requests.get(url, headers=headers, allow_redirects=True, timeout=20)
+        # requests сам пройдет 302 -> 200; нам нужен конечный адрес:
+        final_url = str(r.url) if getattr(r, "url", None) else ""
+        if r.status_code != 200:
+            return f"HTTP_{r.status_code}:{final_url}"
+        return final_url or f"HTTP_{r.status_code}:"
+    except Exception as e:
+        return f"ERROR:{repr(e)}"
+
+async def resolve_original_urls(items: list, concurrency: int = 20):
+    sem = asyncio.Semaphore(concurrency)
+
+    async def one(item):
+        idn = item.get("id_news", "")
+        if not idn:
+            item["original_url"] = ""
+            return
+        async with sem:
+            res = await asyncio.to_thread(_resolve_click_sync, idn)
+            item["original_url"] = res
+
+    await asyncio.gather(*(one(it) for it in items))
+
+# ----------- pipeline -----------
+def dedupe_by_id(items: list) -> list:
+    seen = set()
+    out = []
+    for it in items:
+        idn = it.get("id_news", "")
+        if idn and idn not in seen:
+            seen.add(idn)
+            out.append(it)
+    return out
+
+def filter_banned(items: list) -> list:
+    out = []
+    for it in items:
+        source = (it.get("source") or "").lower()
+        orig = (it.get("original_url") or "").lower()
+        bad = any(b in source for b in BANNED_SUBSTRINGS) or any(b in orig for b in BANNED_SUBSTRINGS)
+        if not bad:
+            out.append(it)
+    return out
 
 async def run():
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -287,20 +387,16 @@ async def run():
         while attempts < max_attempts:
             attempts += 1
 
-            # load page
             await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
-            # cookies + initial wait
             accepted = await maybe_accept_cookies(page) or accepted
             await page.wait_for_timeout(EXTRA_WAIT_MS)
 
-            # wait for at least one news row
             try:
                 await page.wait_for_selector(NEWS_ITEM_SELECTOR, timeout=NEWS_WAIT_TIMEOUT)
                 news_ready = True
             except Exception:
                 news_ready = False
 
-            # pick container and scroll
             container_sel, container_loc = await pick_scroll_container(page)
 
             if news_ready:
@@ -312,15 +408,13 @@ async def run():
                     container_loc,
                 )
                 if scroll_stats.get("reload_required"):
-                    # reload and try again from scratch
                     continue
                 else:
                     break
             else:
-                # nothing rendered? reload
                 continue
 
-        # save HTML/screenshot for diagnostics
+        # save HTML/screenshot
         host = urlparse(URL).netloc or "demo"
         stem = safe_filename(host)
         html_path = f"{OUT_DIR}/demo_{stem}.html"
@@ -337,11 +431,26 @@ async def run():
             pass
 
         # parse items from DOM
-        items = []
         try:
             items = await page.evaluate(EXTRACT_JS)
         except Exception:
             items = []
+
+        # страховочная нормализация времени
+        for it in items:
+            it["time_iso"] = normalize_time_iso_py(it.get("time_iso", ""))
+
+        # сразу удалим дубли по id_news перед кликами (экономит запросы)
+        items = dedupe_by_id(items)
+
+        # подтянем original_url (конкурентно, но с ограничением)
+        await resolve_original_urls(items, concurrency=20)
+
+        # фильтрация по source/original_url
+        items = filter_banned(items)
+
+        # финальная де-дупликация по id_news (на случай, если что-то просочилось)
+        items = dedupe_by_id(items)
 
         result = {
             "scraped_at_utc": utcnow_iso(),
@@ -352,7 +461,7 @@ async def run():
             "min_scrolls_required": min_scrolls_required,
             "scroll": scroll_stats,
             "found": len(items),
-            "items": items,               # список словарей с полезными полями
+            "items": items,
             "html_file": html_path,
             "screenshot_file": png_path,
         }
