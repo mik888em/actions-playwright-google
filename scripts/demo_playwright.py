@@ -4,7 +4,7 @@ from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 
 OUT_DIR = "out"
-URL = os.environ.get("URL") or "https://httpbin.org/html"
+URL = os.environ.get("URL") or "https://cryptopanic.com"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -16,12 +16,37 @@ LOCALE = "en-US"
 TIMEZONE_ID = "Europe/Athens"
 VIEWPORT = {"width": 1280, "height": 800}
 
+EXTRA_WAIT_MS = 5000          # доп. ожидание после загрузки страницы (5c)
+NEWS_WAIT_TIMEOUT = 20000     # ждём появления новости (до 20c)
+
 def utcnow_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 def safe_filename(s: str, max_len: int = 80) -> str:
     s = re.sub(r"[^\w.-]+", "_", s, flags=re.UNICODE).strip("._") or "file"
     return s[:max_len]
+
+async def maybe_accept_cookies(page) -> bool:
+    """
+    Пытаемся убрать куки-баннер (CryptoPanic: <a class="btn btn-outline-primary">Accept</a>).
+    Возвращаем True, если кликнули успешно.
+    """
+    selectors = [
+        'a:has-text("Accept")',
+        'button:has-text("Accept")',
+        'a.btn.btn-outline-primary:has-text("Accept")',
+        'text=Accept',
+        'a:has-text("Принять")',
+        'button:has-text("Принять")',
+    ]
+    for sel in selectors:
+        try:
+            await page.locator(sel).first.click(timeout=1200)
+            await page.wait_for_timeout(300)
+            return True
+        except Exception:
+            pass
+    return False
 
 async def run():
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -35,9 +60,23 @@ async def run():
             extra_http_headers={"Accept-Language": ACCEPT_LANGUAGE},
         )
         page = await context.new_page()
+
+        # Грузим страницу и даём ей "подышать"
         await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
 
-        # сохраняем HTML/скрин
+        accepted = await maybe_accept_cookies(page)
+        await page.wait_for_timeout(EXTRA_WAIT_MS)
+
+        # Ждём, чтобы появилась хотя бы одна новость .news-cell.nc-date
+        news_ready = False
+        try:
+            # достаточно появления любого такого элемента
+            await page.wait_for_selector(".news-cell.nc-date", timeout=NEWS_WAIT_TIMEOUT)
+            news_ready = True
+        except Exception:
+            news_ready = False  # всё равно продолжим — сделаем снимок для диагностики
+
+        # Сохраняем HTML/скрин
         host = urlparse(URL).netloc or "demo"
         stem = safe_filename(host)
         html_path = f"{OUT_DIR}/demo_{stem}.html"
@@ -53,25 +92,13 @@ async def run():
         except Exception:
             pass
 
-        # извлечём заголовок и параграфы
-        data = await page.evaluate("""
-        () => {
-          const title = document.title || "";
-          const h1 = (document.querySelector("h1")?.textContent || "").trim();
-          const ps = Array.from(document.querySelectorAll("p"))
-                          .map(p => (p.textContent || "").trim())
-                          .filter(Boolean)
-                          .slice(0, 10);
-          return { title, h1, paragraphs: ps };
-        }
-        """)
-
+        # Немного диагностических данных
         result = {
             "scraped_at_utc": utcnow_iso(),
             "url": URL,
-            "title": data["title"],
-            "h1": data["h1"],
-            "paragraphs": data["paragraphs"],
+            "accepted_cookies": accepted,
+            "news_ready": news_ready,
+            "wait_ms": EXTRA_WAIT_MS,
             "html_file": html_path,
             "screenshot_file": png_path,
         }
