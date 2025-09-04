@@ -14,7 +14,7 @@ on:
       url:
         description: 'URL для демо-скрапинга (используется при mode=demo)'
         required: false
-        default: 'https://httpbin.org/html'
+        default: 'https://cryptopanic.com'
 
 jobs:
   serp:
