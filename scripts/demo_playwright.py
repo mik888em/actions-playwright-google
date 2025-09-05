@@ -6,11 +6,10 @@ CryptoPanic demo with Playwright + enrich:
 - Чистим "HTTP_XXX:" если домен совпадает с source
 - Фильтруем по нежелательным доменам
 - Дедуп по id_news
-- **НОВОЕ**: тянем текст исходной статьи:
+- Тянем текст исходной статьи:
   * если домен == cryptopanic.com -> text_of_site = '---'
-  * иначе открываем страницу в Playwright, пробуем Ctrl+A / Ctrl+C и читаем буфер
-    (permissions: clipboard-read/clipboard-write), fallback: document.body.innerText
-  * параллелим: 1 страница на домен одновременно, глобально до TEXT_GLOBAL_CONCURRENCY
+  * иначе пробуем Ctrl+A / Ctrl+C и читаем буфер; fallback: document.body.innerText
+  * параллелим: 1 запрос на домен, глобально до TEXT_GLOBAL_CONCURRENCY
 """
 import os, re, json, datetime, asyncio, random, time, email.utils
 from urllib.parse import urlparse
@@ -103,7 +102,7 @@ def domain_eq(a: str, b: str) -> bool:
     if b.startswith("www."): b = b[4:]
     return a == b
 
-def parse_retry_after(value: str) -> float | None:
+def parse_retry_after(value: str):
     if not value:
         return None
     value = value.strip()
@@ -119,7 +118,7 @@ def parse_retry_after(value: str) -> float | None:
     except Exception:
         return None
 
-def extract_url_only(s: str) -> str | None:
+def extract_url_only(s: str):
     """Из 'HTTP_404:https://site/...' или 'ERROR:...' достать сам https://..."""
     if not s:
         return None
@@ -393,12 +392,11 @@ async def resolve_original_urls(items: list, concurrency: int):
     await asyncio.gather(*(one(it) for it in items))
 
 # ----------- source text fetcher -----------
-async def fetch_page_text(context, url: str) -> str | None:
+async def fetch_page_text(context, url: str):
     """Открыть url, попытаться скопировать через буфер, fallback: innerText."""
     page = await context.new_page()
     try:
-        resp = await page.goto(url, wait_until="domcontentloaded", timeout=TEXT_GOTO_TIMEOUT)
-        # иногда полезно дождаться networkidle, но не всегда возможно
+        await page.goto(url, wait_until="domcontentloaded", timeout=TEXT_GOTO_TIMEOUT)
         try:
             await page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
@@ -407,7 +405,8 @@ async def fetch_page_text(context, url: str) -> str | None:
         await maybe_accept_cookies(page)
         await page.wait_for_timeout(TEXT_EXTRA_WAIT_MS)
 
-        # Попытка Ctrl+A / Ctrl+C и чтение буфера
+        # Ctrl+A / Ctrl+C и чтение буфера
+        clip = None
         try:
             await page.keyboard.press("Control+A")
             await page.keyboard.press("Control+C")
@@ -418,7 +417,6 @@ async def fetch_page_text(context, url: str) -> str | None:
             clip = None
 
         if not clip or not clip.strip():
-            # fallback: innerText (видимый текст с переносами)
             try:
                 clip = await page.evaluate(
                     "(() => (document.body && document.body.innerText) || (document.documentElement && document.documentElement.innerText) || '')"
@@ -429,7 +427,6 @@ async def fetch_page_text(context, url: str) -> str | None:
         if clip is None:
             return None
 
-        # Нормализация переносов
         txt = re.sub(r"\r\n?", "\n", clip)
         txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
         return txt if txt else None
@@ -443,17 +440,14 @@ async def enrich_with_source_text(context, items: list):
     """
     Добавляет item['text_of_site'].
     Параллелим по доменам: не более 1 запроса на домен одновременно,
-    и глобально не более TEXT_GLOBAL_CONCURRENCY доменов/страниц.
+    и глобально не более TEXT_GLOBAL_CONCURRENCY.
     """
-    # Предзаполним поле
     for it in items:
         it["text_of_site"] = "---"
 
-    # Список задач: только там, где есть внешний URL и не cryptopanic
     tasks = []
-    url_cache: dict[str, str] = {}  # url -> text
+    url_cache: dict[str, str] = {}
 
-    # Соберём домены и создадим семафоры по домену
     urls = []
     for it in items:
         raw = it.get("original_url") or ""
@@ -475,29 +469,22 @@ async def enrich_with_source_text(context, items: list):
     global_sem = asyncio.Semaphore(max(1, min(TEXT_GLOBAL_CONCURRENCY, len(unique_domains) or 1)))
 
     async def one(it, url):
-        # кэш на случай повторяющихся URL
         if url in url_cache:
             it["text_of_site"] = url_cache[url]
             return
-
         try:
             dom = urlparse(url).netloc.lower()
         except Exception:
             return
 
-        # небольшая случайная задержка перед стартом
         await asyncio.sleep(random.uniform(TEXT_JITTER_MIN_SEC, TEXT_JITTER_MAX_SEC))
 
-        # лимиты
         async with global_sem:
             async with domain_sems.get(dom, asyncio.Semaphore(1)):
                 text = await fetch_page_text(context, url)
                 if text and text.strip():
                     it["text_of_site"] = text
                     url_cache[url] = text
-                else:
-                    # оставляем '---'
-                    pass
 
     for it, url in urls:
         tasks.append(asyncio.create_task(one(it, url)))
@@ -549,7 +536,7 @@ async def run():
             timezone_id=TIMEZONE_ID,
             viewport=VIEWPORT,
             extra_http_headers={"Accept-Language": ACCEPT_LANGUAGE},
-            permissions=["clipboard-read", "clipboard-write"],  # для чтения буфера
+            permissions=["clipboard-read", "clipboard-write"],
         )
         page = await context.new_page()
 
@@ -595,9 +582,64 @@ async def run():
         html_path = f"{OUT_DIR}/demo_{stem}.html"
         png_path  = f"{OUT_DIR}/demo_{stem}.png"
         try:
+            html_content = await page.content()
             with open(html_path, "w", encoding="utf-8") as f:
-                f.write(await page.content())
+                f.write(html_content)
         except Exception:
             pass
         try:
-            await page.scre
+            await page.screenshot(path=png_path, full_page=True)
+        except Exception:
+            pass
+
+        # parse items from DOM
+        try:
+            items = await page.evaluate(EXTRACT_JS)
+        except Exception:
+            items = []
+
+        # normalize time
+        for it in items:
+            it["time_iso"] = normalize_time_iso_py(it.get("time_iso", ""))
+
+        # первичный дедуп по id_news
+        items = dedupe_by_id(items)
+
+        # подтянем original_url (с ограничением конкуррентности и ретраями на 429)
+        await resolve_original_urls(items, concurrency=CLICK_CONCURRENCY)
+
+        # пост-обработка original_url против source (чистим HTTP_XXX: префикс при совпадении домена)
+        clean_original_vs_source(items)
+
+        # фильтрация по нежелательным доменам
+        items = filter_banned(items)
+
+        # финальная дедупликация
+        items = dedupe_by_id(items)
+
+        # --- подтянуть текст статей с источников ---
+        await enrich_with_source_text(context, items)
+
+        result = {
+            "scraped_at_utc": utcnow_iso(),
+            "url": URL,
+            "attempts": attempts,
+            "accepted_cookies": accepted,
+            "news_ready": news_ready,
+            "min_scrolls_required": min_scrolls_required,
+            "scroll": scroll_stats,
+            "found": len(items),
+            "items": items,
+            "html_file": html_path,
+            "screenshot_file": png_path,
+        }
+        with open(f"{OUT_DIR}/demo.json", "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+
+        await context.close()
+        await browser.close()
+
+    print("Saved demo → out/demo.json (+ html/png).")
+
+if __name__ == "__main__":
+    asyncio.run(run())
