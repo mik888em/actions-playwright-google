@@ -2,14 +2,15 @@
 """
 CryptoPanic demo with Playwright + enrich:
 - Нормализуем time_iso (UTC)
-- Разрешаем original_url с ретраями при 429
+- Разрешаем original_url с ретраями при 429 (до 10 попыток, рандомная пауза/Retry-After)
 - Чистим "HTTP_XXX:" если домен совпадает с source
 - Фильтруем по нежелательным доменам
 - Дедуп по id_news
 - Тянем текст исходной статьи:
   * если домен == cryptopanic.com -> text_of_site = '---'
-  * иначе пробуем Ctrl+A / Ctrl+C и читаем буфер; fallback: document.body.innerText
-  * параллелим: 1 запрос на домен, глобально до TEXT_GLOBAL_CONCURRENCY
+  * иначе сначала Ctrl+A / Ctrl+C + чтение клипборда; fallback: document.body/element.innerText
+  * параллелим: глобально до TEXT_GLOBAL_CONCURRENCY, не более 1 запроса на домен одновременно
+  * все исключения внутри задач подавляются, чтобы не отменять остальные
 """
 import os, re, json, datetime, asyncio, random, time, email.utils
 from urllib.parse import urlparse
@@ -393,7 +394,7 @@ async def resolve_original_urls(items: list, concurrency: int):
 
 # ----------- source text fetcher -----------
 async def fetch_page_text(context, url: str):
-    """Открыть url, попытаться скопировать через буфер, fallback: innerText."""
+    """Открыть url, попытаться скопировать через буфер, fallback: innerText. Возвращает str или None."""
     page = await context.new_page()
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=TEXT_GOTO_TIMEOUT)
@@ -405,11 +406,37 @@ async def fetch_page_text(context, url: str):
         await maybe_accept_cookies(page)
         await page.wait_for_timeout(TEXT_EXTRA_WAIT_MS)
 
-        # Ctrl+A / Ctrl+C и чтение буфера
-        clip = None
+        # На всякий случай сфокусируем body.
+        try:
+            await page.locator("body").click(timeout=1500)
+        except Exception:
+            pass
+
+        # Попытка Select All (через execCommand — устойчивее в headless)
+        try:
+            await page.evaluate("""() => {
+                try {
+                  const sel = window.getSelection();
+                  if (sel) sel.removeAllRanges();
+                  const range = document.createRange();
+                  range.selectNodeContents(document.body || document.documentElement);
+                  sel.addRange(range);
+                  document.execCommand && document.execCommand('copy');
+                } catch(e) {}
+            }""")
+        except Exception:
+            pass
+
+        # Ctrl+A / Ctrl+C
         try:
             await page.keyboard.press("Control+A")
             await page.keyboard.press("Control+C")
+        except Exception:
+            pass
+
+        clip = None
+        try:
+            # Может не сработать из-за политик — это нормально, есть fallback ниже.
             clip = await page.evaluate(
                 "async () => { try { return await navigator.clipboard.readText(); } catch(e) { return null } }"
             )
@@ -419,7 +446,10 @@ async def fetch_page_text(context, url: str):
         if not clip or not clip.strip():
             try:
                 clip = await page.evaluate(
-                    "(() => (document.body && document.body.innerText) || (document.documentElement && document.documentElement.innerText) || '')"
+                    "(() => {"
+                    " const el = document.body || document.documentElement;"
+                    " return el ? (el.innerText || el.textContent || '') : '';"
+                    "})()"
                 )
             except Exception:
                 clip = None
@@ -441,6 +471,7 @@ async def enrich_with_source_text(context, items: list):
     Добавляет item['text_of_site'].
     Параллелим по доменам: не более 1 запроса на домен одновременно,
     и глобально не более TEXT_GLOBAL_CONCURRENCY.
+    Любые исключения внутри задач глотаем во избежание отмены остальных.
     """
     for it in items:
         it["text_of_site"] = "---"
@@ -465,32 +496,41 @@ async def enrich_with_source_text(context, items: list):
         except Exception:
             pass
 
+    # семафоры по доменам и глобальный
     domain_sems = {dom: asyncio.Semaphore(TEXT_PER_DOMAIN) for dom in unique_domains}
     global_sem = asyncio.Semaphore(max(1, min(TEXT_GLOBAL_CONCURRENCY, len(unique_domains) or 1)))
 
     async def one(it, url):
-        if url in url_cache:
-            it["text_of_site"] = url_cache[url]
-            return
         try:
-            dom = urlparse(url).netloc.lower()
+            if url in url_cache:
+                it["text_of_site"] = url_cache[url]
+                return
+
+            try:
+                dom = urlparse(url).netloc.lower()
+            except Exception:
+                return
+
+            # Лёгкий джиттер — меньше шансов триггерить защиту.
+            await asyncio.sleep(random.uniform(TEXT_JITTER_MIN_SEC, TEXT_JITTER_MAX_SEC))
+
+            async with global_sem:
+                async with domain_sems.get(dom, asyncio.Semaphore(1)):
+                    text = await fetch_page_text(context, url)
+                    if text and text.strip():
+                        it["text_of_site"] = text
+                        url_cache[url] = text
         except Exception:
+            # Любые ошибки источника не должны валить весь процесс.
+            # Оставляем '---'.
             return
-
-        await asyncio.sleep(random.uniform(TEXT_JITTER_MIN_SEC, TEXT_JITTER_MAX_SEC))
-
-        async with global_sem:
-            async with domain_sems.get(dom, asyncio.Semaphore(1)):
-                text = await fetch_page_text(context, url)
-                if text and text.strip():
-                    it["text_of_site"] = text
-                    url_cache[url] = text
 
     for it, url in urls:
         tasks.append(asyncio.create_task(one(it, url)))
 
     if tasks:
-        await asyncio.gather(*tasks)
+        # Не прерываем остальные задачи, даже если часть упала.
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 # ----------- pipeline utils -----------
 def dedupe_by_id(items: list) -> list:
@@ -636,6 +676,7 @@ async def run():
         with open(f"{OUT_DIR}/demo.json", "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
 
+        # Закрываем только после завершения всех задач.
         await context.close()
         await browser.close()
 
