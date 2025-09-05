@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 CryptoPanic demo with Playwright + enrich:
-- JS-экстрактор нормализует время в UTC 'YYYY-MM-DDTHH:MM:SSZ'
-- извлекается id_news
-- concurrent GET к https://cryptopanic.com/news/click/{id}/ -> original_url
-- фильтр по source/original_url на binance.com/x.com/youtube.com
-- coins + votes (как в примере из JS)
-- удаление дублей по id_news
+- Нормализуем time_iso в 'YYYY-MM-DDTHH:MM:SSZ' (UTC)
+- Извлекаем id_news
+- GET к https://cryptopanic.com/news/click/{id}/ -> original_url
+  * до 10 ретраев при 429 с рандомной паузой (учитываем Retry-After если есть)
+  * по итогу, если все 10 раз 429 — пишем "HTTP_429:https://cryptopanic.com/news/click/XXXXXX/"
+- Если original_url имеет вид "HTTP_XXX:https://<domain>/..." и <domain> == source, то убираем префикс "HTTP_XXX:" — оставляем чистый URL
+- Фильтр по source/original_url на binance.com/x.com/youtube.com
+- Извлекаем coins + votes
+- Дедуп по id_news
 """
 import os, re, json, datetime, asyncio, random, time, email.utils
 from urllib.parse import urlparse
@@ -40,7 +43,7 @@ RAND_SCROLLS_MAX = 40          # upper bound
 
 NEWS_ITEM_SELECTOR = "div.news-row.news-row-link"
 CONTAINER_CANDIDATES = [
-    "div.news-container.ps",   # perfect-scrollbar container (most likely)
+    "div.news-container.ps",
     "div.news-container",
     "div[class*='news-container']",
 ]
@@ -52,6 +55,13 @@ LOADING_SPAN = f"{LOAD_MORE_ROOT} span:has-text('Loading...')"
 
 BANNED_SUBSTRINGS = ("binance.com", "x.com", "youtube.com")
 
+# --- click resolver tuning (anti-429) ---
+CLICK_CONCURRENCY = int(os.environ.get("CLICK_CONCURRENCY", "8"))  # мягче, чтобы меньше 429
+CLICK_MAX_TRIES = 10
+CLICK_SLEEP_MIN_SEC = 2
+CLICK_SLEEP_MAX_SEC = 6
+CLICK_TIMEOUT_SEC = 30
+
 # ---------------- utils ----------------
 def utcnow_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -62,13 +72,12 @@ def safe_filename(s: str, max_len: int = 80) -> str:
 
 def normalize_time_iso_py(s: str) -> str:
     """
-    Страховка: привести строку даты к 'YYYY-MM-DDTHH:MM:SSZ' (UTC).
+    Привести строку даты к 'YYYY-MM-DDTHH:MM:SSZ' (UTC).
     Если не удается — вернуть исходник.
     """
     if not s:
         return s
     try:
-        # стандартный ISO 8601 либо с Z, либо с оффсетом
         if s.endswith("Z"):
             dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
         else:
@@ -76,11 +85,39 @@ def normalize_time_iso_py(s: str) -> str:
         return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     except Exception:
         try:
-            # попытка распарсить странные строки вида 'Thu Sep 04 2025 ...'
             dt = email.utils.parsedate_to_datetime(s)
             return dt.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         except Exception:
             return s
+
+def domain_eq(a: str, b: str) -> bool:
+    a = (a or "").lower().strip()
+    b = (b or "").lower().strip()
+    if not a or not b:
+        return False
+    if a.startswith("www."): a = a[4:]
+    if b.startswith("www."): b = b[4:]
+    return a == b
+
+def parse_retry_after(value: str) -> float | None:
+    """Поддержка секундного Retry-After или даты."""
+    if not value:
+        return None
+    value = value.strip()
+    # 1) число секунд
+    if re.fullmatch(r"\d+", value):
+        try:
+            return float(value)
+        except Exception:
+            return None
+    # 2) http-date
+    try:
+        dt = email.utils.parsedate_to_datetime(value)
+        # если дата в прошлом — игнор
+        delta = (dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+        return max(0.0, delta)
+    except Exception:
+        return None
 
 # ---------------- page helpers ----------------
 async def maybe_accept_cookies(page) -> bool:
@@ -131,22 +168,18 @@ async def click_load_more_until_done(page) -> bool:
             visible = await btn.is_visible()
         except Exception:
             visible = False
-
         if not visible:
             return True
-
         try:
             await btn.click(timeout=1500)
         except Exception:
             pass
-
         await page.wait_for_timeout(5000)
         try:
             if not await page.locator(LOAD_MORE_BTN).is_visible():
                 return True
         except Exception:
             return True
-
         if time.monotonic() - started > 15:
             return False
 
@@ -168,11 +201,9 @@ async def ensure_progress_or_reload(page) -> bool:
     ok = await wait_loading_spinner_disappear(page)
     if not ok:
         return False
-
     ok = await click_load_more_until_done(page)
     if not ok:
         return False
-
     return True
 
 async def scroll_until_goals(page, item_selector, min_items, min_steps, container_loc):
@@ -182,15 +213,12 @@ async def scroll_until_goals(page, item_selector, min_items, min_steps, containe
         last_count = await page.locator(item_selector).count()
     except Exception:
         last_count = 0
-
     while steps < SCROLL_MAX_STEPS:
         if last_count >= min_items and steps >= min_steps:
             break
-
         await scroll_once(page, container_loc)
         await page.wait_for_timeout(SCROLL_PAUSE_MS)
         steps += 1
-
         ok = await ensure_progress_or_reload(page)
         if not ok:
             return {
@@ -200,21 +228,17 @@ async def scroll_until_goals(page, item_selector, min_items, min_steps, containe
                 "reached_goal": False,
                 "reload_required": True,
             }
-
         try:
             curr = await page.locator(item_selector).count()
         except Exception:
             curr = last_count
-
         if curr <= last_count:
             stalled += 1
         else:
             stalled = 0
             last_count = curr
-
         if stalled >= STALL_LIMIT:
             break
-
     return {
         "final_count": last_count,
         "steps": steps,
@@ -223,7 +247,7 @@ async def scroll_until_goals(page, item_selector, min_items, min_steps, containe
         "reload_required": False,
     }
 
-# ----------- JS extractor (расширенный) -----------
+# ----------- JS extractor (coins + votes) -----------
 EXTRACT_JS = r"""
 () => {
   function abs(u){ try { return new URL(u, location.origin).href } catch(e){ return u || '' } }
@@ -234,8 +258,7 @@ EXTRACT_JS = r"""
       if(!raw) return "";
       const d = new Date(raw);
       if (isNaN(d)) return "";
-      // toISOString уже в UTC; уберем миллисекунды для строгого формата
-      return d.toISOString().replace(/\.\d{3}Z$/, "Z");
+      return d.toISOString().replace(/\.\d{3}Z$/, "Z"); // UTC без миллисекунд
     } catch(e){ return "" }
   }
   function extractCoins(row){
@@ -306,29 +329,48 @@ EXTRACT_JS = r"""
 }
 """
 
-# ----------- click resolver (конкурентно с ограничением) -----------
+# ----------- click resolver (c 429-ретраями) -----------
 def _resolve_click_sync(id_news: str) -> str:
     """
-    Синхронный резолвер оригинальной ссылки.
-    Возвращает финальный URL (200), либо 'HTTP_XXX:...'/ 'ERROR:...'
+    Возвращает финальный URL (200) или "HTTP_XXX:<final_or_click_url>".
+    При 429 делает до CLICK_MAX_TRIES попыток с паузой.
     """
-    try:
-        url = f"https://cryptopanic.com/news/click/{id_news}/"  # важно: со слешем
-        headers = {
-            "User-Agent": USER_AGENT,
-            "Accept-Language": ACCEPT_LANGUAGE,
-            "Referer": "https://cryptopanic.com/",
-        }
-        r = requests.get(url, headers=headers, allow_redirects=True, timeout=20)
-        # requests сам пройдет 302 -> 200; нам нужен конечный адрес:
-        final_url = str(r.url) if getattr(r, "url", None) else ""
-        if r.status_code != 200:
-            return f"HTTP_{r.status_code}:{final_url}"
-        return final_url or f"HTTP_{r.status_code}:"
-    except Exception as e:
-        return f"ERROR:{repr(e)}"
+    click_url = f"https://cryptopanic.com/news/click/{id_news}/"  # важно: со слешем
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": ACCEPT_LANGUAGE,
+        "Referer": "https://cryptopanic.com/",
+    }
+    last_exc = None
+    last_status = None
+    for attempt in range(1, CLICK_MAX_TRIES + 1):
+        try:
+            r = requests.get(click_url, headers=headers, allow_redirects=True, timeout=CLICK_TIMEOUT_SEC)
+            final_url = str(r.url) if getattr(r, "url", None) else ""
+            status = r.status_code
+            if status == 429:
+                last_status = 429
+                # предпочтём Retry-After, если есть
+                retry_after_hdr = r.headers.get("Retry-After")
+                sleep_s = parse_retry_after(retry_after_hdr)
+                if sleep_s is None:
+                    sleep_s = random.uniform(CLICK_SLEEP_MIN_SEC, CLICK_SLEEP_MAX_SEC)
+                time.sleep(sleep_s)
+                continue  # пробуем ещё
+            if status != 200:
+                return f"HTTP_{status}:{final_url or click_url}"
+            return final_url or f"HTTP_{status}:{click_url}"
+        except Exception as e:
+            last_exc = e
+            # мягкая пауза и ещё раз
+            time.sleep(random.uniform(CLICK_SLEEP_MIN_SEC, CLICK_SLEEP_MAX_SEC))
+    # Если все попытки с 429 — возвращаем специальную метку
+    if last_status == 429:
+        return f"HTTP_429:{click_url}"
+    # Иначе ошибка сети и т.п.
+    return f"ERROR:{repr(last_exc) if last_exc else 'unknown'}"
 
-async def resolve_original_urls(items: list, concurrency: int = 20):
+async def resolve_original_urls(items: list, concurrency: int):
     sem = asyncio.Semaphore(concurrency)
 
     async def one(item):
@@ -342,7 +384,7 @@ async def resolve_original_urls(items: list, concurrency: int = 20):
 
     await asyncio.gather(*(one(it) for it in items))
 
-# ----------- pipeline -----------
+# ----------- pipeline utils -----------
 def dedupe_by_id(items: list) -> list:
     seen = set()
     out = []
@@ -363,6 +405,26 @@ def filter_banned(items: list) -> list:
             out.append(it)
     return out
 
+def clean_original_vs_source(items: list) -> None:
+    """
+    Если original_url начинается с 'HTTP_XXX:' и домен в URL совпадает с source,
+    то убираем префикс 'HTTP_XXX:' и оставляем чистый URL.
+    Пример:
+    source = 'blocknews.com'
+    original_url = 'HTTP_404:https://blocknews.com/....' -> 'https://blocknews.com/...'
+    """
+    for it in items:
+        orig = it.get("original_url") or ""
+        src = (it.get("source") or "").strip()
+        m = re.match(r"^HTTP_\d{3}:(https?://.+)$", orig, flags=re.I)
+        if not (m and src):
+            continue
+        url_only = m.group(1)
+        dom = urlparse(url_only).netloc
+        if domain_eq(dom, src):
+            it["original_url"] = url_only  # чистим префикс
+
+# ----------- main run -----------
 async def run():
     os.makedirs(OUT_DIR, exist_ok=True)
     async with async_playwright() as p:
@@ -379,14 +441,12 @@ async def run():
         attempts = 0
         max_attempts = 3
         scroll_stats = None
-        container_sel = None
         min_scrolls_required = random.randint(RAND_SCROLLS_MIN, RAND_SCROLLS_MAX)
         accepted = False
         news_ready = False
 
         while attempts < max_attempts:
             attempts += 1
-
             await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
             accepted = await maybe_accept_cookies(page) or accepted
             await page.wait_for_timeout(EXTRA_WAIT_MS)
@@ -397,7 +457,7 @@ async def run():
             except Exception:
                 news_ready = False
 
-            container_sel, container_loc = await pick_scroll_container(page)
+            _, container_loc = await pick_scroll_container(page)
 
             if news_ready:
                 scroll_stats = await scroll_until_goals(
@@ -419,7 +479,6 @@ async def run():
         stem = safe_filename(host)
         html_path = f"{OUT_DIR}/demo_{stem}.html"
         png_path  = f"{OUT_DIR}/demo_{stem}.png"
-
         try:
             with open(html_path, "w", encoding="utf-8") as f:
                 f.write(await page.content())
@@ -436,20 +495,23 @@ async def run():
         except Exception:
             items = []
 
-        # страховочная нормализация времени
+        # normalize time
         for it in items:
             it["time_iso"] = normalize_time_iso_py(it.get("time_iso", ""))
 
-        # сразу удалим дубли по id_news перед кликами (экономит запросы)
+        # первичный дедуп по id_news
         items = dedupe_by_id(items)
 
-        # подтянем original_url (конкурентно, но с ограничением)
-        await resolve_original_urls(items, concurrency=20)
+        # подтянем original_url (с ограничением конкуррентности и ретраями на 429)
+        await resolve_original_urls(items, concurrency=CLICK_CONCURRENCY)
 
-        # фильтрация по source/original_url
+        # пост-обработка original_url против source (чистим HTTP_XXX: префикс при совпадении домена)
+        clean_original_vs_source(items)
+
+        # фильтрация по нежелательным доменам
         items = filter_banned(items)
 
-        # финальная де-дупликация по id_news (на случай, если что-то просочилось)
+        # финальная дедупликация
         items = dedupe_by_id(items)
 
         result = {
