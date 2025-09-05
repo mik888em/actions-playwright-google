@@ -19,7 +19,8 @@ on:
 jobs:
   serp:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Увеличили общий таймаут джоба, чтобы исключить автокэнсел.
+    timeout-minutes: 60
 
     steps:
       - name: Checkout (force main)
@@ -31,13 +32,18 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: '3.12'
+          # Небольшое ускорение повторных запусков
+          cache: 'pip'
+          cache-dependency-path: 'requirements-playwright.txt'
 
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements-playwright.txt
           python -m playwright install --with-deps chromium
+        # Явный таймаут шага установки, чтобы не висел бесконечно.
+        timeout-minutes: 20
 
       - name: Show repo tree (debug)
         run: |
@@ -52,9 +58,11 @@ jobs:
 
       - name: Run scraper
         env:
-          QUERY: ${{ github.event.inputs.query }}
-          MODE:  ${{ github.event.inputs.mode }}
-          URL:   ${{ github.event.inputs.url }}
+          QUERY: ${{ inputs.query }}
+          MODE:  ${{ inputs.mode }}
+          URL:   ${{ inputs.url }}
+        # Большой таймаут именно для шага с парсингом.
+        timeout-minutes: 50
         run: |
           set -e
           echo "MODE=$MODE"
@@ -65,7 +73,11 @@ jobs:
           fi
 
       - name: Upload artifacts (JSON + screenshot)
+        # Выгружаем артефакты и при успехе, и при ошибке шага Run scraper.
+        if: success() || failure()
         uses: actions/upload-artifact@v4
         with:
           name: google-serp-output
           path: out/
+          if-no-files-found: warn
+          retention-days: 7
