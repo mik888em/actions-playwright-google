@@ -19,8 +19,11 @@ on:
 jobs:
   serp:
     runs-on: ubuntu-latest
-    # Увеличили общий таймаут джоба, чтобы исключить автокэнсел.
-    timeout-minutes: 60
+    timeout-minutes: 30  # headful + расширение медленнее
+
+    env:
+      EXT_ID: ddkjiahejlhfcafbddmgiahcphecmpfh   # uBlock Origin Lite
+      EXT_DIR: ${{ github.workspace }}/extensions/uBOL
 
     steps:
       - name: Checkout (force main)
@@ -32,52 +35,57 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-          # Небольшое ускорение повторных запусков
-          cache: 'pip'
-          cache-dependency-path: 'requirements-playwright.txt'
+          python-version: "3.12"
 
-      - name: Install Python deps
+      - name: Install Python deps + Playwright
         run: |
+          set -e
           python -m pip install --upgrade pip
           pip install -r requirements-playwright.txt
           python -m playwright install --with-deps chromium
-        # Явный таймаут шага установки, чтобы не висел бесконечно.
-        timeout-minutes: 20
+          sudo apt-get update
+          sudo apt-get install -y unzip xvfb
+
+      - name: Download & unpack uBlock Origin Lite
+        run: |
+          set -e
+          mkdir -p "$EXT_DIR"
+          # Скачиваем CRX напрямую из веб-магазина по ID
+          CRX_URL="https://clients2.google.com/service/update2/crx?response=redirect&prodversion=123.0.0.0&acceptformat=crx2,crx3&x=id%3D$EXT_ID%26uc"
+          curl -L "$CRX_URL" -o /tmp/ubol.crx
+          unzip -q -o /tmp/ubol.crx -d "$EXT_DIR"
+          test -f "$EXT_DIR/manifest.json" && echo "Extension unpacked OK"
 
       - name: Show repo tree (debug)
         run: |
           echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
           pwd
           ls -la
-          echo "----- find (maxdepth 3) -----"
+          echo "----- extensions -----"
+          find extensions -maxdepth 3 -type f -print || true
+          echo "----- project files -----"
           find . -maxdepth 3 -type f -print | sort
           echo "----- check files exist -----"
           test -f ./scripts/google_serp_playwright.py && echo "OK: google_serp_playwright.py"
           test -f ./scripts/demo_playwright.py && echo "OK: demo_playwright.py" || echo "demo_playwright.py (опционально, для mode=demo)"
 
-      - name: Run scraper
+      - name: Run scraper (headful via Xvfb; passes EXTENSION_DIR)
         env:
-          QUERY: ${{ inputs.query }}
-          MODE:  ${{ inputs.mode }}
-          URL:   ${{ inputs.url }}
-        # Большой таймаут именно для шага с парсингом.
-        timeout-minutes: 50
+          QUERY: ${{ github.event.inputs.query }}
+          MODE:  ${{ github.event.inputs.mode }}
+          URL:   ${{ github.event.inputs.url }}
+          EXTENSION_DIR: ${{ env.EXT_DIR }}
         run: |
           set -e
           echo "MODE=$MODE"
           if [ "$MODE" = "demo" ]; then
-            python ./scripts/demo_playwright.py
+            xvfb-run -a python ./scripts/demo_playwright.py
           else
-            python ./scripts/google_serp_playwright.py
+            xvfb-run -a python ./scripts/google_serp_playwright.py
           fi
 
       - name: Upload artifacts (JSON + screenshot)
-        # Выгружаем артефакты и при успехе, и при ошибке шага Run scraper.
-        if: success() || failure()
         uses: actions/upload-artifact@v4
         with:
           name: google-serp-output
           path: out/
-          if-no-files-found: warn
-          retention-days: 7
