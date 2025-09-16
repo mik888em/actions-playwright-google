@@ -19,11 +19,15 @@ on:
 jobs:
   serp:
     runs-on: ubuntu-latest
-    timeout-minutes: 30  # headful + расширение медленнее
+    timeout-minutes: 10
 
+    # <<< ВСТАВКА №1 (ЯКОРЬ: сразу ПОСЛЕ 'timeout-minutes: 10') >>>
     env:
-      EXT_ID: ddkjiahejlhfcafbddmgiahcphecmpfh   # uBlock Origin Lite
-      EXT_DIR: ${{ github.workspace }}/extensions/uBOL
+      # Путь к распакованному расширению в вашем репозитории.
+      # Папка должна содержать manifest.json, например:
+      #   extensions/unblock-origin-lite/manifest.json
+      EXTENSION_DIR: ${{ github.workspace }}/extensions/unblock-origin-lite
+    # <<< КОНЕЦ ВСТАВКИ №1 >>>
 
     steps:
       - name: Checkout (force main)
@@ -37,52 +41,47 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install Python deps + Playwright
+      - name: Install Python deps
         run: |
-          set -e
           python -m pip install --upgrade pip
           pip install -r requirements-playwright.txt
           python -m playwright install --with-deps chromium
-          sudo apt-get update
-          sudo apt-get install -y unzip xvfb
-
-      - name: Download & unpack uBlock Origin Lite
-        run: |
-          set -e
-          mkdir -p "$EXT_DIR"
-          # Скачиваем CRX напрямую из веб-магазина по ID
-          CRX_URL="https://clients2.google.com/service/update2/crx?response=redirect&prodversion=123.0.0.0&acceptformat=crx2,crx3&x=id%3D$EXT_ID%26uc"
-          curl -L "$CRX_URL" -o /tmp/ubol.crx
-          unzip -q -o /tmp/ubol.crx -d "$EXT_DIR"
-          test -f "$EXT_DIR/manifest.json" && echo "Extension unpacked OK"
 
       - name: Show repo tree (debug)
         run: |
           echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
           pwd
           ls -la
-          echo "----- extensions -----"
-          find extensions -maxdepth 3 -type f -print || true
-          echo "----- project files -----"
+          echo "----- find (maxdepth 3) -----"
           find . -maxdepth 3 -type f -print | sort
           echo "----- check files exist -----"
           test -f ./scripts/google_serp_playwright.py && echo "OK: google_serp_playwright.py"
           test -f ./scripts/demo_playwright.py && echo "OK: demo_playwright.py" || echo "demo_playwright.py (опционально, для mode=demo)"
+          echo "----- extension dir -----"
+          echo "EXTENSION_DIR=$EXTENSION_DIR"
+          if [ -d "$EXTENSION_DIR" ]; then
+            echo "Found extension at $EXTENSION_DIR"
+          else
+            echo "Extension dir not found (будет headless-режим без расширения)"
+          fi
 
-      - name: Run scraper (headful via Xvfb; passes EXTENSION_DIR)
+      # <<< ВСТАВКА №2 (ЯКОРЬ: заменить СУЩЕСТВУЮЩИЙ шаг 'Run scraper') >>>
+      - name: Run scraper
         env:
           QUERY: ${{ github.event.inputs.query }}
           MODE:  ${{ github.event.inputs.mode }}
           URL:   ${{ github.event.inputs.url }}
-          EXTENSION_DIR: ${{ env.EXT_DIR }}
         run: |
           set -e
           echo "MODE=$MODE"
+          # На GitHub Actions запускаем через виртуальный X-сервер.
+          # Можно всегда оборачивать xvfb-run: это безопасно и работает в обоих режимах.
           if [ "$MODE" = "demo" ]; then
             xvfb-run -a python ./scripts/demo_playwright.py
           else
             xvfb-run -a python ./scripts/google_serp_playwright.py
           fi
+      # <<< КОНЕЦ ВСТАВКИ №2 >>>
 
       - name: Upload artifacts (JSON + screenshot)
         uses: actions/upload-artifact@v4
