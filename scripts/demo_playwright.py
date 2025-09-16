@@ -62,6 +62,11 @@ CLICK_SLEEP_MIN_SEC = 2
 CLICK_SLEEP_MAX_SEC = 6
 CLICK_TIMEOUT_SEC = 30
 
+# --- 502 backoff tuning ---
+CLICK_502_MAX_TRIES = 5             # максимум попыток именно для 502
+CLICK_502_MIN_BASE_SEC = 0.5        # первая пауза: 0.5–1.0 c
+CLICK_502_MAX_BASE_SEC = 1.0
+
 # --- source-text fetcher tuning ---
 TEXT_GLOBAL_CONCURRENCY = int(os.environ.get("TEXT_GLOBAL_CONCURRENCY", "20"))
 TEXT_GOTO_TIMEOUT = 45000
