@@ -553,13 +553,21 @@ def _resolve_click_sync(id_news: str) -> str:
         "Accept-Language": ACCEPT_LANGUAGE,
         "Referer": "https://cryptopanic.com/",
     }
+
     last_exc = None
     last_status = None
-    for _ in range(1, CLICK_MAX_TRIES + 1):
+    tries_502 = 0
+
+    # оставим общий лимит попыток побольше, но 502 ограничим отдельно
+    total_tries = max(CLICK_MAX_TRIES, CLICK_502_MAX_TRIES)
+
+    for _ in range(1, total_tries + 1):
         try:
             r = requests.get(click_url, headers=headers, allow_redirects=True, timeout=CLICK_TIMEOUT_SEC)
             final_url = str(r.url) if getattr(r, "url", None) else ""
             status = r.status_code
+
+            # 429 — как было: ждём Retry-After или случайную паузу
             if status == 429:
                 last_status = 429
                 retry_after_hdr = r.headers.get("Retry-After")
@@ -568,12 +576,34 @@ def _resolve_click_sync(id_news: str) -> str:
                     sleep_s = random.uniform(CLICK_SLEEP_MIN_SEC, CLICK_SLEEP_MAX_SEC)
                 time.sleep(sleep_s)
                 continue
-            if status != 200:
-                return f"HTTP_{status}:{final_url or click_url}"
-            return final_url or f"HTTP_{status}:{click_url}"
+
+            # 502 — новый экспоненциальный бэкофф с джиттером
+            if status == 502:
+                tries_502 += 1
+                if tries_502 >= CLICK_502_MAX_TRIES:
+                    # так и не смогли пробиться
+                    return f"HTTP_502:{final_url or click_url}"
+                # окно ожидания растёт в 2 раза на каждую попытку
+                low = CLICK_502_MIN_BASE_SEC * (2 ** (tries_502 - 1))
+                high = CLICK_502_MAX_BASE_SEC * (2 ** (tries_502 - 1))
+                time.sleep(random.uniform(low, high))
+                continue
+
+            # 200 — успех: вернём конечный URL (или сам click_url, если редиректа не было)
+            if status == 200:
+                return final_url or f"HTTP_{status}:{click_url}"
+
+            # Любой другой код — сразу фиксируем и выходим
+            return f"HTTP_{status}:{final_url or click_url}"
+
         except Exception as e:
             last_exc = e
+            # на сетевых исключениях — короткий случайный сон и ещё раз
             time.sleep(random.uniform(CLICK_SLEEP_MIN_SEC, CLICK_SLEEP_MAX_SEC))
+
+    # сюда дойдём только если все попытки исчерпаны исключениями/429
+    if tries_502 > 0:
+        return f"HTTP_502:{click_url}"
     if last_status == 429:
         return f"HTTP_429:{click_url}"
     return f"ERROR:{repr(last_exc) if last_exc else 'unknown'}"
