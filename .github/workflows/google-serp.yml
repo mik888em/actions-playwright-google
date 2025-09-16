@@ -18,8 +18,8 @@ on:
 
 jobs:
   serp:
+    timeout-minutes: 30
     runs-on: ubuntu-latest
-    timeout-minutes: 10
 
     # <<< ВСТАВКА №1 (ЯКОРЬ: сразу ПОСЛЕ 'timeout-minutes: 10') >>>
     env:
@@ -66,20 +66,29 @@ jobs:
           fi
 
       # <<< ВСТАВКА №2 (ЯКОРЬ: заменить СУЩЕСТВУЮЩИЙ шаг 'Run scraper') >>>
-      - name: Run scraper
+      - name: Run scraper (with heartbeat)
         env:
-          QUERY: ${{ github.event.inputs.query }}
-          MODE:  ${{ github.event.inputs.mode }}
-          URL:   ${{ github.event.inputs.url }}
+          MODE: ${{ github.event.inputs.mode || 'demo' }}
+          QUERY: ${{ github.event.inputs.query || 'site:example.com' }}
+          URL: ${{ github.event.inputs.url || 'https://cryptopanic.com' }}
+          EXTENSION_DIR: ${{ github.workspace }}/extensions/unblock-origin-lite
+          # Дополнительно даём побольше логов от Playwright (необязательно, но помогает избежать "тишины")
+          DEBUG: pw:api
         run: |
-          set -e
+          set -euo pipefail
           echo "MODE=$MODE"
-          # На GitHub Actions запускаем через виртуальный X-сервер.
-          # Можно всегда оборачивать xvfb-run: это безопасно и работает в обоих режимах.
+          echo "EXTENSION_DIR=$EXTENSION_DIR"
+      
+          # Каждые ~55с пишем строку в лог, чтобы GitHub не отменял шаг из-за отсутствия вывода
+          ( while true; do echo "⏳ still running at $(date -u +"%H:%M:%S")"; sleep 55; done ) &
+          HEARTBEAT_PID=$!
+          trap 'kill $HEARTBEAT_PID || true' EXIT
+      
           if [ "$MODE" = "demo" ]; then
-            xvfb-run -a python ./scripts/demo_playwright.py
+            # -u включает небуферизованный вывод Python (ещё меньше шансов "замолчать")
+            xvfb-run -a python -u ./scripts/demo_playwright.py
           else
-            xvfb-run -a python ./scripts/google_serp_playwright.py
+            xvfb-run -a python -u ./scripts/google_serp_playwright.py
           fi
       # <<< КОНЕЦ ВСТАВКИ №2 >>>
 
