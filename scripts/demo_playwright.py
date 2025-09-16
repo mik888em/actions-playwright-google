@@ -12,7 +12,7 @@ CryptoPanic demo with Playwright + enrich:
   * параллелим: глобально до TEXT_GLOBAL_CONCURRENCY, не более 1 запроса на домен одновременно
   * все исключения внутри задач подавляются, чтобы не отменять остальные
 """
-import os, re, json, datetime, asyncio, random, time, email.utils
+import os, re, json, datetime, asyncio, random, time, email.utils, tempfile, shutil
 from urllib.parse import urlparse
 import requests
 
@@ -569,15 +569,43 @@ def clean_original_vs_source(items: list) -> None:
 async def run():
     os.makedirs(OUT_DIR, exist_ok=True)
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(
-            user_agent=USER_AGENT,
-            locale=LOCALE,
-            timezone_id=TIMEZONE_ID,
-            viewport=VIEWPORT,
-            extra_http_headers={"Accept-Language": ACCEPT_LANGUAGE},
-            permissions=["clipboard-read", "clipboard-write"],
-        )
+        # <<< ДОБАВЛЯЕМ/МЕНЯЕМ вот это >>>
+        EXTENSION_DIR = os.environ.get("EXTENSION_DIR")  # путь к распакованному расширению
+        common_args = ["--no-sandbox", "--disable-dev-shm-usage"]
+        
+        browser = None  # чтобы корректно закрыть в конце
+        user_data_dir = None
+        
+        if EXTENSION_DIR and os.path.isdir(EXTENSION_DIR):
+            # Расширения требуют headful + persistent context
+            user_data_dir = tempfile.mkdtemp(prefix="pw-ext-")
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir,
+                headless=False,
+                args=[
+                    f"--disable-extensions-except={EXTENSION_DIR}",
+                    f"--load-extension={EXTENSION_DIR}",
+                    *common_args,
+                ],
+                user_agent=USER_AGENT,
+                locale=LOCALE,
+                timezone_id=TIMEZONE_ID,
+                viewport=VIEWPORT,
+                extra_http_headers={"Accept-Language": ACCEPT_LANGUAGE},
+                permissions=["clipboard-read", "clipboard-write"],
+            )
+        else:
+            # Без расширения — обычный headless браузер
+            browser = await p.chromium.launch(headless=True, args=common_args)
+            context = await browser.new_context(
+                user_agent=USER_AGENT,
+                locale=LOCALE,
+                timezone_id=TIMEZONE_ID,
+                viewport=VIEWPORT,
+                extra_http_headers={"Accept-Language": ACCEPT_LANGUAGE},
+                permissions=["clipboard-read", "clipboard-write"],
+            )
+        # <<< КОНЕЦ ДОБАВЛЕНИЯ >>>
         page = await context.new_page()
 
         attempts = 0
@@ -678,7 +706,10 @@ async def run():
 
         # Закрываем только после завершения всех задач.
         await context.close()
-        await browser.close()
+        if browser:
+            await browser.close()
+        if user_data_dir:
+            shutil.rmtree(user_data_dir, ignore_errors=True)
 
     print("Saved demo → out/demo.json (+ html/png).")
 
