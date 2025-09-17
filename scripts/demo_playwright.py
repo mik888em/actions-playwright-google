@@ -13,6 +13,11 @@ import os, re, json, datetime, asyncio, random, time, email.utils, tempfile, shu
 from urllib.parse import urlparse, unquote
 import requests
 
+# === GAS CONFIG (webhook) — BEGIN ===
+GAS_WEBHOOK_URL = os.environ.get("GAS_WEBHOOK_URL", "").strip()
+GAS_PASSWORD    = os.environ.get("GAS_PASSWORD", "").strip()
+# === GAS CONFIG (webhook) — END ===
+
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 OUT_DIR = "out"
@@ -1010,6 +1015,35 @@ def clean_original_vs_source(items: list) -> None:
         dom = urlparse(url_only).netloc
         if domain_eq(dom, src):
             it["original_url"] = url_only
+            
+# === GAS POST: send JSON items to Google Apps Script — BEGIN ===
+def post_to_gas(items: list[dict]) -> dict:
+    """
+    Отправляет {"password": ..., "items": [...]} на GAS webhook.
+    Возвращает краткий словарь-статус.
+    """
+    if not GAS_WEBHOOK_URL or not GAS_PASSWORD:
+        return {"ok": False, "skipped": True, "reason": "no webhook/password in env"}
+
+    payload = {"password": GAS_PASSWORD, "items": items}
+    try:
+        r = requests.post(
+            GAS_WEBHOOK_URL,
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(payload, ensure_ascii=False),
+            timeout=60,
+        )
+        return {
+            "ok": (r.status_code == 200),
+            "status": r.status_code,
+            "preview": (r.text or "")[:200],
+        }
+    except Exception as e:
+        return {"ok": False, "error": repr(e)}
+
+async def post_to_gas_async(items: list[dict]) -> dict:
+    return await asyncio.to_thread(post_to_gas, items)
+# === GAS POST: send JSON items to Google Apps Script — END ===
 
 # ----------- main run -----------
 async def run():
@@ -1154,6 +1188,13 @@ async def run():
         }
         with open(f"{OUT_DIR}/demo.json", "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
+            
+        # === GAS CALL — отправка items в Google Sheet через Apps Script
+        try:
+            gas_res = await post_to_gas_async(items)
+            print("GAS webhook result:", gas_res)
+        except Exception as e:
+            print("GAS webhook error:", repr(e))
 
         await context.close()
         if browser:
