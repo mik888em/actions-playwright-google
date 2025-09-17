@@ -15,7 +15,16 @@ on:
         description: 'URL для демо-скрапинга (используется при mode=demo)'
         required: false
         default: 'https://cryptopanic.com'
+  schedule:
+    - cron: "*/5 * * * *"   # каждые 5 минут
 
+permissions:
+  contents: read
+
+concurrency:
+  group: serp-schedule
+  cancel-in-progress: true
+    
 jobs:
   serp:
     timeout-minutes: 30
@@ -27,6 +36,8 @@ jobs:
       # Папка должна содержать manifest.json, например:
       #   extensions/unblock-origin-lite/manifest.json
       EXTENSION_DIR: ${{ github.workspace }}/extensions/unblock-origin-lite
+      GAS_WEBHOOK_URL: ${{ secrets.GAS_WEBHOOK_URL }}
+      GAS_PASSWORD:    ${{ secrets.GAS_PASSWORD }}
     # <<< КОНЕЦ ВСТАВКИ №1 >>>
 
     steps:
@@ -65,6 +76,10 @@ jobs:
             echo "Extension dir not found (будет headless-режим без расширения)"
           fi
 
+      - name: Jitter 0–300s (только для schedule)
+        if: ${{ github.event_name == 'schedule' }}
+        run: sleep $((RANDOM % 301))
+
       # <<< ВСТАВКА №2 (ЯКОРЬ: заменить СУЩЕСТВУЮЩИЙ шаг 'Run scraper') >>>
       - name: Run scraper (with heartbeat)
         env:
@@ -93,6 +108,7 @@ jobs:
       # <<< КОНЕЦ ВСТАВКИ №2 >>>
 
       - name: Upload artifacts (JSON + screenshot)
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: google-serp-output
