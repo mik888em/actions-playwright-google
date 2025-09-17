@@ -683,6 +683,73 @@ async def try_enable_ubol_optimal(context):
     return False
 
 # ----------- image/title helpers -----------
+# === CP TITLE_META (description) HELPERS — START ===
+USER_AGENTS_POOL = [
+    # несколько живых вариантов, можно расширять
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    USER_AGENT,  # ваш основной
+]
+
+def _parse_meta_description(html_text: str) -> str:
+    if not html_text:
+        return ""
+    # <meta name="description" content="...">
+    m = re.search(
+        r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']{5,800})["\']',
+        html_text, flags=re.I)
+    if not m:
+        # <meta property="og:description" content="...">
+        m = re.search(
+            r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']{5,800})["\']',
+            html_text, flags=re.I)
+    if not m:
+        return ""
+    desc = m.group(1)
+    desc = html.unescape(desc)
+    desc = re.sub(r"\s+", " ", desc).strip()
+    return desc
+
+async def override_title_meta_from_cp(items: list, concurrency: int = 20, timeout_sec: int = 20):
+    """
+    Для каждого объекта берём url_abs (страница CryptoPanic) и
+    вытаскиваем meta description -> item['title_meta'].
+    Если не удалось — fallback на item['title'], а если он < 15 символов — специальная строка.
+    """
+    sem = asyncio.Semaphore(concurrency)
+
+    def _fetch_cp_html(url_abs: str) -> str | None:
+        if not url_abs:
+            return None
+        headers = {
+            "User-Agent": random.choice(USER_AGENTS_POOL),
+            "Accept-Language": ACCEPT_LANGUAGE,
+            "Referer": "https://cryptopanic.com/",
+        }
+        try:
+            r = requests.get(url_abs, headers=headers, timeout=timeout_sec)
+            if r.status_code == 200 and r.text:
+                return r.text
+        except Exception:
+            pass
+        return None
+
+    async def one(it: dict):
+        url_abs = it.get("url_abs") or ""
+        title    = (it.get("title") or "").strip()
+        html_text = None
+        async with sem:
+            html_text = await asyncio.to_thread(_fetch_cp_html, url_abs)
+        desc = _parse_meta_description(html_text or "")
+        if desc:
+            it["title_meta"] = desc
+        else:
+            it["title_meta"] = title if len(title) >= 15 else "ni4ego_ne_ydalos_ni_otkuda_izvle4"
+
+    await asyncio.gather(*(one(it) for it in items))
+# === CP TITLE_META (description) HELPERS — END ===
+
 IMG_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.svg', '.avif']
 
 def _sanitize_image_url(raw: str) -> str:
@@ -1068,6 +1135,9 @@ async def run():
 
         # --- текст/картинка/тайтл из источников ---
         await enrich_with_source_text(context, items)
+        
+        # --- ПЕРЕЗАПИСЬ title_meta по meta description со страницы CryptoPanic ---
+        await override_title_meta_from_cp(items)
 
         result = {
             "scraped_at_utc": utcnow_iso(),
