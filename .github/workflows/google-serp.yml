@@ -20,15 +20,17 @@ on:
 
 permissions:
   contents: read
-
-concurrency:
-  group: serp-schedule
-  cancel-in-progress: true
     
 jobs:
   serp:
     timeout-minutes: 30
     runs-on: ubuntu-latest
+
+    # <<< ВСТАВКА: job-level concurrency (вариант A — ставим в очередь, НЕ отменяем) >>>
+    concurrency:
+      group: serp-schedule
+      cancel-in-progress: false
+    # <<< КОНЕЦ ВСТАВКИ >>>
 
     # <<< ВСТАВКА №1 (ЯКОРЬ: сразу ПОСЛЕ 'timeout-minutes: 10') >>>
     env:
