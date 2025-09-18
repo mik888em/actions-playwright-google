@@ -1172,6 +1172,25 @@ async def run():
         
         # --- ПЕРЕЗАПИСЬ title_meta по meta description со страницы CryptoPanic ---
         await override_title_meta_from_cp(items)
+        
+        # <<< ВСТАВКА: локальная фильтрация перед отправкой/сохранением >>>
+        def _starts_http(u: str) -> bool:
+            return isinstance(u, str) and (u.startswith("http://") or u.startswith("https://"))
+        
+        # 1) выкинуть объекты без валидного original_url в начале
+        items = [it for it in items if _starts_http(it.get("original_url", ""))]
+        
+        # 2) дедуп по id_news внутри текущего списка
+        _seen = set()
+        _items_dedup = []
+        for it in items:
+            _id = str(it.get("id_news", "")).strip()
+            if not _id or _id in _seen:
+                continue
+            _seen.add(_id)
+            _items_dedup.append(it)
+        items = _items_dedup
+        # <<< КОНЕЦ ВСТАВКИ >>>
 
         result = {
             "scraped_at_utc": utcnow_iso(),
