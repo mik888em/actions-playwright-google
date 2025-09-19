@@ -16,7 +16,7 @@ on:
         required: false
         default: 'https://cryptopanic.com'
   schedule:
-    - cron: "*/5 * * * *"   # каждые 5 минут
+    - cron: "*/7 * * * *"   # каждые 7 минут
 
 permissions:
   contents: read
