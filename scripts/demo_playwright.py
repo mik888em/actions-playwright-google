@@ -1191,6 +1191,18 @@ async def run():
             _items_dedup.append(it)
         items = _items_dedup
         # <<< КОНЕЦ ВСТАВКИ >>>
+        
+        # <<< ВСТАВКА (сортировка по дате для "самые свежие внизу") — НАЧАЛО >>>
+        def _parse_iso_t(s: str) -> float:
+            try:
+                if s and s.endswith("Z"):
+                    return datetime.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                pass
+            return 0.0  # нераспознанное/пустое уедет вверх (самое "старое")
+        # Сортируем по возрастанию времени: старые сверху, новые — внизу массива
+        items.sort(key=lambda it: _parse_iso_t(it.get("time_iso", "")))
+        # <<< ВСТАВКА — КОНЕЦ >>>
 
         result = {
             "scraped_at_utc": utcnow_iso(),
