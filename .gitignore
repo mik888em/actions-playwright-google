@@ -1,0 +1,16 @@
+# Каталог out/ создаёт scripts/demo_playwright.py при генерации отчёта Playwright.
+out/
+
+# Локальное виртуальное окружение Python.
+.venv/
+
+# Кэш CPython.
+__pycache__/
+*.pyc
+
+# Кэш браузера Playwright, создаваемый при установке и запуске.
+playwright/.cache/
+
+# Временные каталоги, которые создают Playwright и вспомогательные скрипты.
+pw-*/
+tmp/
