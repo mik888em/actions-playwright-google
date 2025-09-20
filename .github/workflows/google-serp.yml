@@ -103,9 +103,9 @@ jobs:
       
           if [ "$MODE" = "demo" ]; then
             # -u включает небуферизованный вывод Python (ещё меньше шансов "замолчать")
-            xvfb-run -a python -u ./scripts/demo_playwright.py
+            xvfb-run -a python -u -m scripts.demo_playwright
           else
-            xvfb-run -a python -u ./scripts/google_serp_playwright.py
+            xvfb-run -a python -u -m scripts.google_serp_playwright
           fi
       # <<< КОНЕЦ ВСТАВКИ №2 >>>
 
